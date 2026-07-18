@@ -47,6 +47,26 @@ logging.basicConfig(
 logger = logging.getLogger("ai-sidecar")
 
 
+def _log_config_source() -> None:
+    """Make misconfiguration diagnosable from the first startup lines."""
+    from sqlalchemy.engine.url import make_url
+
+    from .config import _ENV_FILE
+
+    if _ENV_FILE.exists():
+        logger.info("Config: .env loaded from %s", _ENV_FILE)
+    else:
+        logger.warning(
+            "Config: %s NOT FOUND — running on defaults/OS env vars only",
+            _ENV_FILE,
+        )
+    try:
+        dsn = make_url(settings.database_url).render_as_string(hide_password=True)
+    except Exception:
+        dsn = "<unparseable DATABASE_URL>"
+    logger.info("Config: database = %s", dsn)
+
+
 async def _periodic_cookie_sync() -> None:
     """Push rotated Google cookies (file, kept fresh by notebooklm-py) to the DB."""
     while True:
@@ -60,6 +80,7 @@ async def _periodic_cookie_sync() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    _log_config_source()
     await ensure_schema()
     await startup_auto_import()
     comfy.init_http()
