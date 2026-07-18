@@ -5,11 +5,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Type
 
+import secrets
+import string
+
 from sqladmin import BaseView, ModelView, expose
 from sqlalchemy import case, func, select
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
-from wtforms import Form, SelectField
+from wtforms import Form, SelectField, StringField
+from wtforms.validators import Optional as OptionalValidator
 
 from ..comfy import probe_instance
 from ..db import SessionLocal
@@ -57,6 +61,14 @@ async def _login_and_reload(profile: str, fresh: bool = False) -> None:
     except Exception:
         last_login_results[profile] = (False, utcnow())
         logger.exception("Background login for '%s' failed", profile)
+
+
+_KEY_ALPHABET = string.ascii_letters + string.digits
+
+
+def _generate_api_key() -> str:
+    """OpenAI-style bearer key: sk- + 48 alphanumeric chars."""
+    return "sk-" + "".join(secrets.choice(_KEY_ALPHABET) for _ in range(48))
 
 
 class ApiKeyAdmin(ModelView, model=ApiKey):
@@ -116,6 +128,12 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
                 .scalars()
                 .all()
             )
+        # Optional on purpose: blank -> an OpenAI-style key is auto-generated
+        # in on_model_change (the scaffolded PK field would be required).
+        form_class.key_string = StringField(
+            "Key String (leave blank to auto-generate sk-…)",
+            validators=[OptionalValidator()],
+        )
         form_class.key_type = SelectField(
             "Key Type",
             choices=[
@@ -134,7 +152,14 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
         return form_class
 
     async def on_model_change(self, data, model, is_created, request) -> None:
-        """Normalize the kind-specific fields before insert/update."""
+        """Normalize kind-specific fields; auto-generate a blank key string."""
+        key_string = (data.get("key_string") or "").strip()
+        if not key_string:
+            if is_created:
+                data["key_string"] = _generate_api_key()
+            else:
+                # Blank on edit means "keep the existing key".
+                data["key_string"] = model.key_string
         key_type = data.get("key_type") or "google"
         if data.get("profile_name") == "":
             data["profile_name"] = None
