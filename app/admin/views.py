@@ -171,6 +171,9 @@ class ComfyInstanceAdmin(ModelView, model=ComfyInstance):
     icon = "fa-solid fa-image"
     column_list = [ComfyInstance.name, ComfyInstance.base_url, ComfyInstance.enabled]
     form_columns = [ComfyInstance.name, ComfyInstance.base_url, ComfyInstance.enabled]
+    # `name` is the PK — without this SQLAdmin drops it from the create form
+    # and the INSERT fails with "Field 'name' doesn't have a default value".
+    form_include_pk = True
 
 
 class RequestLogAdmin(ModelView, model=RequestLog):
