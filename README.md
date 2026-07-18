@@ -161,7 +161,20 @@ GET /v1/comfy/info    # checkpoint/sampler/scheduler thật của instance
 GET /v1/comfy/queue   # độ sâu hàng đợi
 ```
 
-**Tích hợp 9Router**: mỗi provider = `base_url` sidecar + key tương ứng (google key cho chat, comfy key riêng từng instance cho ảnh; Output Format "JSON (Base64)"/"Binary File" và Size "auto" được hỗ trợ sẵn).
+### Tích hợp 9Router — 3 provider surface riêng
+
+| Provider | Base URL | Auth | `GET /models` trả về |
+|---|---|---|---|
+| Gemini | `http://<host>:<port>/gemini/v1` | google key qua header | `gemini`, `gemini-3-*` |
+| NotebookLM | `http://<host>:<port>/notebooklm/<api-key>/v1` | **key nằm trong URL** — không cần header | toàn bộ notebook id + tiêu đề của profile |
+| ComfyUI (mỗi instance) | `http://<host>:<port>/comfyui/v1` | comfy key qua header | đúng instance của key |
+
+- Mỗi surface chỉ phục vụ backend của nó: gửi notebook id vào `/gemini/v1` (hoặc `gemini` vào `/notebooklm/...`) → 404 kèm chỉ dẫn sang surface đúng.
+- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue`; lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
+- Bề mặt gộp cũ `/v1/*` giữ nguyên (playground, OpenAI SDK, provider cũ).
+- 9Router chạy trong Docker: dùng `http://172.17.0.1:<port>` (bridge IP) thay vì `localhost`.
+- Lưu ý: key trên URL của surface NotebookLM sẽ xuất hiện trong access log — chỉ dùng trong mạng tin cậy.
+- Output Format "JSON (Base64)"/"Binary File" và Size "auto" của form ảnh 9Router được hỗ trợ sẵn.
 
 ---
 

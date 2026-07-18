@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import Depends
+from fastapi import Depends, Path
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, update
 
@@ -38,6 +38,26 @@ class AuthContext:
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+async def lookup_api_key(token: str) -> Optional[AuthContext]:
+    """Resolve an enabled key string to an AuthContext (None if unknown)."""
+    async with SessionLocal() as session:
+        row = (
+            await session.execute(
+                select(ApiKey).where(
+                    ApiKey.key_string == token, ApiKey.enabled.is_(True)
+                )
+            )
+        ).scalar_one_or_none()
+    if row is None:
+        return None
+    return AuthContext(
+        api_key=token,
+        kind=row.key_type or "google",
+        profile_name=row.profile_name,
+        comfy_instance=row.comfy_instance,
+    )
+
+
 async def get_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> AuthContext:
@@ -49,25 +69,35 @@ async def get_auth(
             code="invalid_api_key",
         )
     token = credentials.credentials.strip()
-
-    async with SessionLocal() as session:
-        row = (
-            await session.execute(
-                select(ApiKey).where(
-                    ApiKey.key_string == token, ApiKey.enabled.is_(True)
-                )
-            )
-        ).scalar_one_or_none()
-
-    if row is None:
+    ctx = await lookup_api_key(token)
+    if ctx is None:
         logger.warning("Rejected request with unknown/disabled API key (…%s)", token[-4:])
         raise openai_error(401, "Invalid API key.", code="invalid_api_key")
-    return AuthContext(
-        api_key=token,
-        kind=row.key_type or "google",
-        profile_name=row.profile_name,
-        comfy_instance=row.comfy_instance,
-    )
+    return ctx
+
+
+async def path_google_auth(
+    api_key: str = Path(..., description="A google-type API key"),
+) -> AuthContext:
+    """Auth for the /notebooklm/{api_key}/v1 surface: the key rides the URL.
+
+    9Router registers this provider with the key embedded in the Base URL, so
+    no Authorization header is needed. Note: path keys show up in access
+    logs — acceptable on this trusted deployment; the other surfaces use
+    header auth.
+    """
+    ctx = await lookup_api_key(api_key.strip())
+    if ctx is None:
+        logger.warning("Rejected path API key (…%s)", api_key[-4:])
+        raise openai_error(401, "Invalid API key.", code="invalid_api_key")
+    if ctx.kind != "google" or not ctx.profile_name:
+        raise openai_error(
+            403,
+            "The NotebookLM surface requires a Google-profile API key in the "
+            "URL path.",
+            code="wrong_key_type",
+        )
+    return ctx
 
 
 async def require_google_auth(

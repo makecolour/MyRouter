@@ -38,7 +38,15 @@ from .config import settings
 from .db import engine, ensure_schema
 from .google_auth import startup_auto_import, sync_profile_to_db
 from .pool import close_all, pooled_profiles
-from .routes import chat, images, models_list, notebooklm
+from .routes import (
+    chat,
+    comfy_api,
+    gemini_api,
+    images,
+    models_list,
+    notebooklm,
+    notebooklm_api,
+)
 
 logging.basicConfig(
     level=settings.log_level.upper(),
@@ -120,10 +128,15 @@ async def openai_exception_handler(
     )
 
 
+# Legacy combined surface (/v1/*) — kept for playground, SDKs, old providers.
 app.include_router(chat.router)
 app.include_router(images.router)
 app.include_router(models_list.router)
 app.include_router(notebooklm.router)
+# Split provider surfaces for 9Router (one Base URL per backend).
+app.include_router(gemini_api.router)
+app.include_router(notebooklm_api.router)
+app.include_router(comfy_api.router)
 
 
 @app.get("/healthz")

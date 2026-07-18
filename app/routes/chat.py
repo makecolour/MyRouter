@@ -85,6 +85,17 @@ async def _handle(request: ChatCompletionRequest, ctx: AuthContext):
     else:
         answer = await _notebook_chat(ctx, model, prompt)
 
+    return _chat_response(request, model, prompt, answer, conversation_id)
+
+
+def _chat_response(
+    request: ChatCompletionRequest,
+    model: str,
+    prompt: str,
+    answer: str,
+    conversation_id: Optional[str] = None,
+):
+    """OpenAI response assembly shared by all chat surfaces (stream + JSON)."""
     if request.stream:
         return StreamingResponse(
             sse_chunks(model, answer, conversation_id),

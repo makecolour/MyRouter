@@ -1,7 +1,7 @@
-"""/v1/models — discovery for 9Router: Gemini models + notebooks + comfy instances.
+"""/v1/models — combined discovery surface (legacy) + shared entry builders.
 
-Each backend is listed independently (own try/except), so one failing
-backend degrades to a partial list instead of an error.
+The per-backend builders are reused by the split provider surfaces
+(/gemini/v1, /notebooklm/{api_key}/v1, /comfyui/v1).
 """
 
 import inspect
@@ -22,24 +22,7 @@ logger = logging.getLogger("ai-sidecar.models")
 router = APIRouter()
 
 
-@router.get("/v1/models")
-async def list_models(ctx: AuthContext = Depends(get_auth)):
-    started = time.perf_counter()
-    status = 500
-    error = None
-    try:
-        response = await _handle(ctx)
-        status = 200
-        return response
-    except Exception as exc:
-        status = getattr(exc, "status_code", 500)
-        error = describe_error(exc)
-        raise
-    finally:
-        log_request(ctx, "/v1/models", None, status, started, error)
-
-
-def _static_gemini_models() -> List[dict]:
+def _static_gemini_models() -> List[str]:
     names = []
     for member in GeminiModel:
         name = getattr(member, "model_name", None)
@@ -48,39 +31,12 @@ def _static_gemini_models() -> List[dict]:
     return names
 
 
-async def _handle(ctx: AuthContext) -> dict:
+async def gemini_model_entries(ctx: AuthContext) -> List[dict]:
+    """gemini alias + the account's registry models (static fallback)."""
     created = int(time.time())
-
-    # Comfy keys see exactly their one bound instance.
-    if ctx.kind == "comfy":
-        async with SessionLocal() as session:
-            instance = (
-                await session.execute(
-                    select(ComfyInstance).where(
-                        ComfyInstance.name == ctx.comfy_instance,
-                        ComfyInstance.enabled.is_(True),
-                    )
-                )
-            ).scalar_one_or_none()
-        data = (
-            [
-                {
-                    "id": instance.name,
-                    "object": "model",
-                    "created": created,
-                    "owned_by": "comfyui",
-                }
-            ]
-            if instance
-            else []
-        )
-        return {"object": "list", "data": data}
-
     data: List[dict] = [
         {"id": "gemini", "object": "model", "created": created, "owned_by": "google"}
     ]
-
-    # --- Gemini models (per-account: Pro tiers show up when available) ---
     try:
         gemini_client = await get_gemini_client(ctx.profile_name)
         models = gemini_client.list_models()
@@ -129,14 +85,15 @@ async def _handle(ctx: AuthContext) -> dict:
                     "owned_by": "google",
                 }
             )
+    return data
 
-    # --- NotebookLM notebooks ---
-    try:
-        nb_client = await get_notebook_client(ctx.profile_name)
-        notebooks = await nb_client.notebooks.list()
-    except Exception as exc:
-        logger.warning("Could not list notebooks for '%s': %s", ctx.profile_name, exc)
-        notebooks = []
+
+async def notebook_model_entries(ctx: AuthContext) -> List[dict]:
+    """Every notebook of the key's profile as a model entry (id + title)."""
+    created = int(time.time())
+    nb_client = await get_notebook_client(ctx.profile_name)
+    notebooks = await nb_client.notebooks.list()
+    data: List[dict] = []
     for notebook in notebooks:
         notebook_id = getattr(notebook, "id", None) or getattr(
             notebook, "notebook_id", None
@@ -152,7 +109,60 @@ async def _handle(ctx: AuthContext) -> dict:
                 "display_name": getattr(notebook, "title", None),
             }
         )
+    return data
 
+
+async def comfy_model_entries(ctx: AuthContext) -> List[dict]:
+    """The single instance bound to a comfy key."""
+    created = int(time.time())
+    async with SessionLocal() as session:
+        instance = (
+            await session.execute(
+                select(ComfyInstance).where(
+                    ComfyInstance.name == ctx.comfy_instance,
+                    ComfyInstance.enabled.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+    if instance is None:
+        return []
+    return [
+        {
+            "id": instance.name,
+            "object": "model",
+            "created": created,
+            "owned_by": "comfyui",
+        }
+    ]
+
+
+@router.get("/v1/models")
+async def list_models(ctx: AuthContext = Depends(get_auth)):
+    """Legacy combined surface: everything the key kind can reach."""
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        response = await _handle(ctx)
+        status = 200
+        return response
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(ctx, "/v1/models", None, status, started, error)
+
+
+async def _handle(ctx: AuthContext) -> dict:
+    if ctx.kind == "comfy":
+        return {"object": "list", "data": await comfy_model_entries(ctx)}
+
+    data = await gemini_model_entries(ctx)
+    try:
+        data.extend(await notebook_model_entries(ctx))
+    except Exception as exc:
+        logger.warning("Could not list notebooks for '%s': %s", ctx.profile_name, exc)
     # Google keys don't list ComfyUI entries — image access needs a
-    # per-instance comfy key (v3.5 key-kind split).
+    # per-instance comfy key.
     return {"object": "list", "data": data}
