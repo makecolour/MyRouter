@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy[asyncio]>=2.0
+aiomysql>=0.2.0
+httpx>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+sqladmin>=0.29
+itsdangerous>=2.1
+notebooklm-py
+gemini-webapi
+# used by the gemini cookie warmup utility (login browsers come from notebooklm-py)
+playwright>=1.40

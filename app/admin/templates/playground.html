@@ -1,0 +1,594 @@
+{% extends "sqladmin/layout.html" %}
+{% block content %}
+<style>
+  .pg-response {
+    background: var(--tblr-bg-surface-secondary, #f6f8fb);
+    border: 1px solid var(--tblr-border-color, #e6e7e9);
+    border-radius: 4px;
+    padding: 0.75rem;
+    max-height: 22rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.8rem;
+  }
+  .pg-answer { white-space: pre-wrap; word-break: break-word; }
+  .pg-image { max-width: 100%; border-radius: 4px; }
+  .pg-disabled { opacity: 0.45; pointer-events: none; }
+</style>
+<div class="container-fluid py-3">
+
+  <div class="row mb-3">
+    <div class="col">
+      <h2 class="page-title">API Playground</h2>
+      <div class="text-secondary">
+        Requests go to the real /v1 endpoints with the selected key.
+        Google keys unlock Gemini + NotebookLM; comfy keys unlock ComfyUI.
+        Raw Swagger: <a href="/docs" target="_blank" rel="noopener">/docs</a>.
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-body">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-6">
+          <label class="form-label" for="pg-key">API key</label>
+          <select id="pg-key" class="form-select">
+            <option value="" data-kind="">— select an API key —</option>
+            {% for k in keys %}
+            <option value="{{ k.key }}" data-kind="{{ k.kind }}">
+              {{ k.label or k.key }} — {{ k.target }} [{{ k.kind }}]
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-6">
+          <span id="pg-status" class="text-secondary"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <!-- ============ GEMINI ============ -->
+    <div class="col-lg-6">
+      <div id="panel-gemini" class="card mb-3 pg-disabled">
+        <div class="card-header"><h3 class="card-title">Gemini</h3></div>
+        <div class="card-body">
+          <label class="form-label" for="gm-model">Model</label>
+          <select id="gm-model" class="form-select mb-2"></select>
+          <label class="form-label" for="gm-conv">Conversation
+            <span class="text-secondary">(sidecar history — Google's sidebar doesn't list API chats)</span>
+          </label>
+          <div class="input-group mb-1">
+            <select id="gm-conv" class="form-select"></select>
+            <button id="gm-conv-reset" class="btn btn-outline-secondary" type="button">New</button>
+            <button id="gm-conv-del" class="btn btn-outline-danger" type="button">Delete</button>
+          </div>
+          <div id="gm-conv-status" class="text-secondary mb-2"></div>
+          <label class="form-label" for="gm-prompt">Message</label>
+          <textarea id="gm-prompt" class="form-control mb-2" rows="3" placeholder="Ask something…"></textarea>
+          <button id="gm-send" class="btn btn-primary" type="button">Send</button>
+          <div id="gm-answer" class="mt-3"></div>
+          <pre id="gm-raw" class="pg-response mt-2 d-none"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ NOTEBOOKLM ============ -->
+    <div class="col-lg-6">
+      <div id="panel-nblm" class="card mb-3 pg-disabled">
+        <div class="card-header"><h3 class="card-title">NotebookLM</h3></div>
+        <div class="card-body">
+          <label class="form-label" for="nb-notebook">Notebook</label>
+          <select id="nb-notebook" class="form-select mb-2"></select>
+          <label class="form-label" for="nb-command">Command</label>
+          <select id="nb-command" class="form-select mb-2">
+            <option value="chat">chat</option>
+            <option value="generate">generate</option>
+            <option value="artifacts">list artifacts</option>
+            <option value="status">status</option>
+            <option value="download">download</option>
+          </select>
+
+          <div id="nb-f-message">
+            <label class="form-label" for="nb-prompt">Message</label>
+            <textarea id="nb-prompt" class="form-control mb-2" rows="3" placeholder="Ask the notebook…"></textarea>
+          </div>
+          <div id="nb-f-type" class="d-none">
+            <label class="form-label" for="nb-type">Artifact type</label>
+            <select id="nb-type" class="form-select mb-2">
+              <option>audio</option><option>video</option><option>report</option>
+              <option>study_guide</option><option>quiz</option><option>flashcards</option>
+              <option>slide_deck</option><option>infographic</option>
+              <option>data_table</option><option>mind_map</option>
+            </select>
+          </div>
+          <div id="nb-f-instructions" class="d-none">
+            <label class="form-label" for="nb-instructions">Instructions (optional)</label>
+            <textarea id="nb-instructions" class="form-control mb-2" rows="2"
+                      placeholder="Focus on…"></textarea>
+          </div>
+          <div id="nb-f-task" class="d-none">
+            <label class="form-label" for="nb-task">Task / artifact id</label>
+            <input id="nb-task" class="form-control mb-2" placeholder="task id from generate">
+          </div>
+          <div id="nb-f-format" class="d-none">
+            <label class="form-label" for="nb-format">Format</label>
+            <select id="nb-format" class="form-select mb-2">
+              <option value="">(default)</option>
+              <option>pdf</option><option>pptx</option>
+              <option>json</option><option>markdown</option><option>html</option>
+            </select>
+          </div>
+
+          <button id="nb-send" class="btn btn-primary" type="button">Run</button>
+          <div id="nb-result" class="mt-3"></div>
+          <pre id="nb-raw" class="pg-response mt-2 d-none"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ COMFYUI ============ -->
+    <div class="col-lg-6">
+      <div id="panel-comfy" class="card mb-3 pg-disabled">
+        <div class="card-header">
+          <h3 class="card-title">ComfyUI <span id="cf-instance" class="text-secondary"></span></h3>
+        </div>
+        <div class="card-body">
+          <label class="form-label" for="cf-prompt">Prompt</label>
+          <textarea id="cf-prompt" class="form-control mb-2" rows="2"
+                    placeholder="a red apple on a wooden table, photo"></textarea>
+          <label class="form-label" for="cf-size">Size</label>
+          <select id="cf-size" class="form-select mb-2">
+            <option>512x512</option><option>768x768</option><option>1024x1024</option>
+            <option>auto</option>
+          </select>
+          <label class="form-label" for="cf-output">Output</label>
+          <select id="cf-output" class="form-select mb-2">
+            <option value="url">URL</option>
+            <option value="b64_json">JSON (Base64)</option>
+            <option value="binary">Binary file</option>
+          </select>
+          <details class="mb-2">
+            <summary>Advanced</summary>
+            <div class="row g-2 mt-1">
+              <div class="col-12">
+                <label class="form-label" for="cf-checkpoint">Checkpoint</label>
+                <select id="cf-checkpoint" class="form-select"><option value="">(default)</option></select>
+              </div>
+              <div class="col-6">
+                <label class="form-label" for="cf-sampler">Sampler</label>
+                <select id="cf-sampler" class="form-select"><option value="">(default)</option></select>
+              </div>
+              <div class="col-6">
+                <label class="form-label" for="cf-scheduler">Scheduler</label>
+                <select id="cf-scheduler" class="form-select"><option value="">(default)</option></select>
+              </div>
+              <div class="col-4">
+                <label class="form-label" for="cf-steps">Steps</label>
+                <input id="cf-steps" type="number" class="form-control" placeholder="25">
+              </div>
+              <div class="col-4">
+                <label class="form-label" for="cf-cfg">CFG</label>
+                <input id="cf-cfg" type="number" step="0.5" class="form-control" placeholder="7.0">
+              </div>
+              <div class="col-4">
+                <label class="form-label" for="cf-seed">Seed</label>
+                <input id="cf-seed" type="number" class="form-control" placeholder="random">
+              </div>
+              <div class="col-12">
+                <label class="form-label" for="cf-negative">Negative prompt</label>
+                <input id="cf-negative" class="form-control" placeholder="(default)">
+              </div>
+            </div>
+          </details>
+          <button id="cf-send" class="btn btn-primary" type="button">Generate image</button>
+          <span id="cf-queue" class="ms-2 text-secondary"></span>
+          <div id="cf-result" class="mt-3"></div>
+          <pre id="cf-raw" class="pg-response mt-2 d-none"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var keySel = $("pg-key"), statusEl = $("pg-status");
+  var pollTimer = null;
+
+  function kind() {
+    var opt = keySel.options[keySel.selectedIndex];
+    return opt ? (opt.getAttribute("data-kind") || "") : "";
+  }
+  function headers() {
+    return { "Authorization": "Bearer " + keySel.value, "Content-Type": "application/json" };
+  }
+  function setPanel(id, on) { $(id).classList.toggle("pg-disabled", !on); }
+  function addOption(sel, group, value, text) {
+    var opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    (group || sel).appendChild(opt);
+  }
+  function showRaw(pre, data) {
+    pre.textContent = JSON.stringify(data, null, 2);
+    pre.classList.remove("d-none");
+  }
+  function alertBox(target, ok, text) {
+    target.innerHTML = "";
+    var div = document.createElement("div");
+    div.className = "alert pg-answer alert-" + (ok ? "success" : "danger");
+    div.textContent = text;
+    target.appendChild(div);
+  }
+  function errText(status, data) {
+    return "Error " + status + ": " + ((data && data.error && data.error.message) || "request failed");
+  }
+  async function api(path, opts) {
+    var resp = await fetch(path, Object.assign({ headers: headers() }, opts || {}));
+    var ct = resp.headers.get("content-type") || "";
+    if (ct.indexOf("json") === -1) return { resp: resp, data: null };
+    return { resp: resp, data: await resp.json() };
+  }
+
+  // ---------- key change: gate panels + load models/info ----------
+  async function onKeyChange() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    var k = kind();
+    setPanel("panel-gemini", k === "google");
+    setPanel("panel-nblm", k === "google");
+    setPanel("panel-comfy", k === "comfy");
+    $("gm-model").innerHTML = ""; $("nb-notebook").innerHTML = "";
+    $("cf-instance").textContent = "";
+    if (!keySel.value) { statusEl.textContent = ""; return; }
+    statusEl.textContent = "Loading models…";
+    try {
+      var r = await api("/v1/models");
+      if (!r.resp.ok) { statusEl.textContent = errText(r.resp.status, r.data); return; }
+      var gm = $("gm-model"), nb = $("nb-notebook");
+      r.data.data.forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m.id;
+        if (m.owned_by === "google") {
+          opt.textContent = m.display_name ? (m.display_name + " — " + m.id) : m.id;
+          gm.appendChild(opt);
+        } else if (m.owned_by === "notebooklm") {
+          opt.textContent = (m.display_name || "(untitled)") + " — " + m.id.slice(0, 8) + "…";
+          nb.appendChild(opt);
+        } else if (m.owned_by === "comfyui") {
+          $("cf-instance").textContent = "— " + m.id;
+        }
+      });
+      statusEl.textContent = "Loaded " + r.data.data.length + " models.";
+      if (k === "comfy") loadComfyInfo();
+      if (k === "google") loadConversations();
+    } catch (e) { statusEl.textContent = "Failed: " + e; }
+  }
+
+  // ---------- Gemini ----------
+  // Conversations come from the sidecar's own history (/v1/conversations);
+  // the selection is persisted per (API key, model) so a page reload
+  // continues the same thread instead of silently starting a new one.
+  function convStoreKey() {
+    return "pgconv:" + keySel.value + ":" + $("gm-model").value;
+  }
+  function updateConvStatus() {
+    var v = $("gm-conv").value;
+    $("gm-conv-status").textContent = v
+      ? "Will continue " + v : "Will start a NEW conversation";
+  }
+  function restoreConvSelection() {
+    var sel = $("gm-conv");
+    var saved = localStorage.getItem(convStoreKey()) || "";
+    sel.value = saved;
+    if (sel.value !== saved) sel.value = "";
+    updateConvStatus();
+  }
+  async function loadConversations(selectId) {
+    var sel = $("gm-conv");
+    sel.innerHTML = "";
+    addOption(sel, null, "", "— New conversation —");
+    if (keySel.value) {
+      try {
+        var r = await api("/v1/conversations");
+        if (r.resp.ok) {
+          r.data.data.forEach(function (c) {
+            var label = c.title || c.id;
+            if (label.length > 42) label = label.slice(0, 42) + "…";
+            addOption(sel, null, c.id, label + "  [" + (c.model || "?") + "]");
+          });
+        }
+      } catch (e) { /* history unavailable — New still works */ }
+    }
+    if (selectId) {
+      sel.value = selectId;
+      updateConvStatus();
+    } else {
+      restoreConvSelection();
+    }
+  }
+
+  async function gmSend() {
+    var model = $("gm-model").value, msg = $("gm-prompt").value.trim();
+    if (!model || !msg) return;
+    var priorConv = $("gm-conv").value;
+    $("gm-send").disabled = true;
+    $("gm-answer").textContent = "Waiting…";
+    try {
+      var body = {
+        model: model,
+        messages: [{ role: "user", content: msg }],
+        conversation_id: priorConv || "new"
+      };
+      var r = await api("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
+      showRaw($("gm-raw"), r.data);
+      if (r.resp.ok) {
+        alertBox($("gm-answer"), true, r.data.choices[0].message.content);
+        if (r.data.conversation_id) {
+          localStorage.setItem(convStoreKey(), r.data.conversation_id);
+          await loadConversations(r.data.conversation_id);
+          $("gm-conv-status").textContent = priorConv
+            ? "Continued " + r.data.conversation_id
+            : "Started NEW conversation " + r.data.conversation_id;
+        }
+      } else {
+        alertBox($("gm-answer"), false, errText(r.resp.status, r.data));
+      }
+    } catch (e) { alertBox($("gm-answer"), false, "Request failed: " + e); }
+    $("gm-send").disabled = false;
+  }
+
+  async function gmDeleteConv() {
+    var conv = $("gm-conv").value;
+    if (!conv) return;
+    var r = await api("/v1/conversations/" + conv, { method: "DELETE" });
+    if (r.resp.ok) {
+      localStorage.removeItem(convStoreKey());
+      await loadConversations("");
+    }
+  }
+
+  // ---------- NotebookLM ----------
+  function nbCommandChanged() {
+    var c = $("nb-command").value;
+    $("nb-f-message").classList.toggle("d-none", c !== "chat");
+    $("nb-f-type").classList.toggle("d-none", c !== "generate" && c !== "download");
+    $("nb-f-instructions").classList.toggle("d-none", c !== "generate");
+    $("nb-f-task").classList.toggle("d-none", c !== "status" && c !== "download");
+    $("nb-f-format").classList.toggle("d-none", c !== "download");
+  }
+
+  function nbTable(items) {
+    var target = $("nb-result");
+    target.innerHTML = "";
+    if (!items.length) { target.textContent = "No artifacts."; return; }
+    var html = "<div class='table-responsive'><table class='table table-sm'><thead><tr>" +
+      "<th>id</th><th>type</th><th>title</th><th>status</th></tr></thead><tbody>";
+    items.forEach(function (a) {
+      var id = a.artifact_id || a.id || "";
+      html += "<tr><td><code>" + id + "</code></td><td>" +
+        (a.type || a.artifact_type || "") + "</td><td>" +
+        (a.title || a.name || "") + "</td><td>" + (a.status || "") + "</td></tr>";
+    });
+    target.innerHTML = html + "</tbody></table></div>";
+  }
+
+  function nbPollStatus(nbId, taskId) {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async function () {
+      var r = await api("/v1/notebooklm/" + nbId + "/status/" + taskId);
+      if (r.data) showRaw($("nb-raw"), r.data);
+      var st = r.data && (r.data.status || "");
+      if (!r.resp.ok || (st && st !== "in_progress" && st !== "pending")) {
+        clearInterval(pollTimer); pollTimer = null;
+        alertBox($("nb-result"), st === "completed",
+          "Generation " + (st || "failed") + " (task " + taskId + ")");
+      } else {
+        $("nb-result").textContent = "Generating… status: " + (st || "?");
+      }
+    }, 5000);
+  }
+
+  async function nbRun() {
+    var nbId = $("nb-notebook").value, c = $("nb-command").value;
+    if (!nbId) return;
+    $("nb-send").disabled = true;
+    $("nb-result").textContent = "Working…";
+    $("nb-raw").classList.add("d-none");
+    try {
+      if (c === "chat") {
+        var msg = $("nb-prompt").value.trim();
+        if (msg) {
+          var r = await api("/v1/chat/completions", {
+            method: "POST",
+            body: JSON.stringify({ model: nbId, messages: [{ role: "user", content: msg }] })
+          });
+          showRaw($("nb-raw"), r.data);
+          if (r.resp.ok) alertBox($("nb-result"), true, r.data.choices[0].message.content);
+          else alertBox($("nb-result"), false, errText(r.resp.status, r.data));
+        }
+      } else if (c === "generate") {
+        var r2 = await api("/v1/notebooklm/generate", {
+          method: "POST",
+          body: JSON.stringify({
+            notebook_id: nbId,
+            type: $("nb-type").value,
+            instructions: $("nb-instructions").value.trim() || null
+          })
+        });
+        showRaw($("nb-raw"), r2.data);
+        if (r2.resp.ok) {
+          var task = r2.data.task_id || r2.data.artifact_id || "";
+          $("nb-task").value = task;
+          alertBox($("nb-result"), true, "Started — task " + task + " (auto-polling status…)");
+          if (task) nbPollStatus(nbId, task);
+        } else alertBox($("nb-result"), false, errText(r2.resp.status, r2.data));
+      } else if (c === "artifacts") {
+        var r3 = await api("/v1/notebooklm/" + nbId + "/artifacts");
+        showRaw($("nb-raw"), r3.data);
+        if (r3.resp.ok) nbTable(r3.data.artifacts);
+        else alertBox($("nb-result"), false, errText(r3.resp.status, r3.data));
+      } else if (c === "status") {
+        var task2 = $("nb-task").value.trim();
+        if (task2) {
+          var r4 = await api("/v1/notebooklm/" + nbId + "/status/" + task2);
+          showRaw($("nb-raw"), r4.data);
+          alertBox($("nb-result"), r4.resp.ok, r4.resp.ok
+            ? ("Status: " + (r4.data.status || "?")) : errText(r4.resp.status, r4.data));
+        }
+      } else if (c === "download") {
+        var q = [];
+        var art = $("nb-task").value.trim();
+        var fmt = $("nb-format").value;
+        if (art) q.push("artifact_id=" + encodeURIComponent(art));
+        if (fmt) q.push("format=" + encodeURIComponent(fmt));
+        var url = "/v1/notebooklm/" + nbId + "/download/" + $("nb-type").value +
+          (q.length ? "?" + q.join("&") : "");
+        var resp = await fetch(url, { headers: headers() });
+        if (resp.ok) {
+          var blob = await resp.blob();
+          var cd = resp.headers.get("content-disposition") || "";
+          var m = cd.match(/filename="?([^\";]+)"?/);
+          var a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = m ? m[1] : ($("nb-type").value + "-download");
+          a.click();
+          URL.revokeObjectURL(a.href);
+          alertBox($("nb-result"), true, "Downloaded " + a.download +
+            " (" + Math.round(blob.size / 1024) + " KB)");
+        } else {
+          var data = await resp.json().catch(function () { return null; });
+          alertBox($("nb-result"), false, errText(resp.status, data));
+        }
+      }
+    } catch (e) { alertBox($("nb-result"), false, "Request failed: " + e); }
+    $("nb-send").disabled = false;
+  }
+
+  // ---------- ComfyUI ----------
+  function fillSelect(sel, values) {
+    sel.innerHTML = "";
+    var d = document.createElement("option");
+    d.value = ""; d.textContent = "(default)";
+    sel.appendChild(d);
+    (values || []).forEach(function (v) {
+      var o = document.createElement("option");
+      o.value = v; o.textContent = v;
+      sel.appendChild(o);
+    });
+  }
+
+  async function loadComfyInfo() {
+    try {
+      var r = await api("/v1/comfy/info");
+      if (r.resp.ok) {
+        fillSelect($("cf-checkpoint"), r.data.checkpoints);
+        fillSelect($("cf-sampler"), r.data.samplers);
+        fillSelect($("cf-scheduler"), r.data.schedulers);
+      }
+      var q = await api("/v1/comfy/queue");
+      if (q.resp.ok) {
+        $("cf-queue").textContent = "queue: " + q.data.running + " running / " +
+          q.data.pending + " pending";
+      }
+    } catch (e) { /* instance offline — advanced stays default */ }
+  }
+
+  function cfShowImage(src) {
+    var img = document.createElement("img");
+    img.src = src; img.className = "pg-image";
+    $("cf-result").appendChild(img);
+  }
+
+  async function cfSend() {
+    var prompt = $("cf-prompt").value.trim();
+    if (!prompt) return;
+    var out = $("cf-output").value;
+    $("cf-send").disabled = true;
+    $("cf-result").textContent = "Generating… (this can take a while)";
+    $("cf-raw").classList.add("d-none");
+    try {
+      var body = { prompt: prompt, size: $("cf-size").value };
+      if (out !== "url") body.response_format = out;
+      if ($("cf-checkpoint").value) body.checkpoint = $("cf-checkpoint").value;
+      if ($("cf-sampler").value) body.sampler = $("cf-sampler").value;
+      if ($("cf-scheduler").value) body.scheduler = $("cf-scheduler").value;
+      if ($("cf-steps").value) body.steps = parseInt($("cf-steps").value, 10);
+      if ($("cf-cfg").value) body.cfg = parseFloat($("cf-cfg").value);
+      if ($("cf-seed").value) body.seed = parseInt($("cf-seed").value, 10);
+      if ($("cf-negative").value.trim()) body.negative_prompt = $("cf-negative").value.trim();
+
+      if (out === "binary") {
+        var resp = await fetch("/v1/images/generations", {
+          method: "POST", headers: headers(), body: JSON.stringify(body)
+        });
+        $("cf-result").innerHTML = "";
+        if (resp.ok) {
+          var blob = await resp.blob();
+          cfShowImage(URL.createObjectURL(blob));
+          $("cf-raw").textContent = "(binary " + (blob.type || "image/png") + ", " +
+            Math.round(blob.size / 1024) + " KB)";
+          $("cf-raw").classList.remove("d-none");
+        } else {
+          var errData = await resp.json().catch(function () { return null; });
+          alertBox($("cf-result"), false, errText(resp.status, errData));
+        }
+      } else {
+        var r = await api("/v1/images/generations", { method: "POST", body: JSON.stringify(body) });
+        $("cf-result").innerHTML = "";
+        if (r.resp.ok) {
+          r.data.data.forEach(function (item) {
+            if (item.b64_json) {
+              cfShowImage("data:image/png;base64," + item.b64_json);
+            } else {
+              var a = document.createElement("a");
+              a.href = item.url; a.target = "_blank"; a.rel = "noopener";
+              var img = document.createElement("img");
+              img.src = item.url; img.className = "pg-image";
+              a.appendChild(img);
+              $("cf-result").appendChild(a);
+            }
+          });
+          if (out === "b64_json") {
+            $("cf-raw").textContent = "(b64_json payload, " +
+              JSON.stringify(r.data).length + " chars — hidden)";
+            $("cf-raw").classList.remove("d-none");
+          } else {
+            showRaw($("cf-raw"), r.data);
+          }
+        } else {
+          alertBox($("cf-result"), false, errText(r.resp.status, r.data));
+        }
+      }
+    } catch (e) { alertBox($("cf-result"), false, "Request failed: " + e); }
+    $("cf-send").disabled = false;
+  }
+
+  keySel.addEventListener("change", onKeyChange);
+  $("gm-model").addEventListener("change", restoreConvSelection);
+  $("gm-conv").addEventListener("change", function () {
+    var v = $("gm-conv").value;
+    if (v) localStorage.setItem(convStoreKey(), v);
+    else localStorage.removeItem(convStoreKey());
+    updateConvStatus();
+  });
+  $("gm-send").addEventListener("click", gmSend);
+  $("gm-conv-reset").addEventListener("click", function () {
+    $("gm-conv").value = "";
+    localStorage.removeItem(convStoreKey());
+    updateConvStatus();
+  });
+  $("gm-conv-del").addEventListener("click", gmDeleteConv);
+  $("nb-command").addEventListener("change", nbCommandChanged);
+  $("nb-send").addEventListener("click", nbRun);
+  $("cf-send").addEventListener("click", cfSend);
+  nbCommandChanged();
+})();
+</script>
+{% endblock %}

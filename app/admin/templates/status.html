@@ -1,0 +1,186 @@
+{% extends "sqladmin/layout.html" %}
+{% block content %}
+<style>
+  .error-cell {
+    max-width: 24rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>
+<div class="container-fluid py-3">
+
+  <div class="row mb-3">
+    <div class="col">
+      <h2 class="page-title">AI Sidecar — Status</h2>
+      {% if login_running %}
+      <div class="alert alert-warning mt-2 mb-0">
+        An interactive Google login is currently running — finish it in the
+        browser window that opened on the server machine. This page refreshes
+        automatically every 5 seconds.
+      </div>
+      <script>setTimeout(function () { window.location.reload(); }, 5000);</script>
+      {% endif %}
+      {% for res in login_results %}
+      <div class="alert alert-{{ 'success' if res.ok else 'danger' }} mt-2 mb-0">
+        {% if res.ok %}
+        Login for <strong>{{ res.profile }}</strong> completed at {{ res.at }} —
+        auth saved to the database and clients reloaded.
+        {% else %}
+        Login for <strong>{{ res.profile }}</strong> failed at {{ res.at }} —
+        check the server logs.
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    <div class="col-auto">
+      <form method="post" action="/admin/status/sync" class="d-inline">
+        <button class="btn btn-outline-secondary" type="submit">Sync cookies to DB now</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-header"><h3 class="card-title">Google Profiles</h3></div>
+    <div class="table-responsive">
+      <table class="table table-vcenter card-table">
+        <thead>
+          <tr>
+            <th>Profile</th><th>Status</th><th>Clients pooled</th>
+            <th>Last login</th><th>Last cookie sync</th><th class="w-1">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in profiles %}
+          <tr>
+            <td><strong>{{ p.name }}</strong></td>
+            <td>
+              {% if p.logging_in %}<span class="badge bg-yellow text-yellow-fg">logging in…</span>
+              {% elif p.status == "active" %}<span class="badge bg-green text-green-fg">active</span>
+              {% elif p.status == "expired" %}<span class="badge bg-red text-red-fg">expired</span>
+              {% elif p.status == "pending_login" %}<span class="badge bg-yellow text-yellow-fg">pending login</span>
+              {% else %}<span class="badge bg-secondary">{{ p.status }}</span>{% endif %}
+            </td>
+            <td>{{ "yes" if p.pooled else "no" }}</td>
+            <td>{{ p.last_login_at or "—" }}</td>
+            <td>{{ p.last_synced_at or "—" }}</td>
+            <td>
+              <div class="btn-list flex-nowrap">
+                <form method="post" action="/admin/status/login" class="d-flex align-items-center gap-2">
+                  <input type="hidden" name="profile" value="{{ p.name }}">
+                  <button class="btn btn-sm btn-primary" type="submit" {% if login_running %}disabled{% endif %}>
+                    Re-login
+                  </button>
+                  <label class="form-check form-check-inline mb-0" title="Clears the profile's cached browser session — use to switch the Google account">
+                    <input class="form-check-input" type="checkbox" name="fresh" value="1">
+                    <span class="form-check-label">fresh</span>
+                  </label>
+                </form>
+                <form method="post" action="/admin/status/reload">
+                  <input type="hidden" name="profile" value="{{ p.name }}">
+                  <button class="btn btn-sm btn-outline-secondary" type="submit">Reload clients</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="text-secondary">No Google profiles yet — add one below.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-footer">
+      <form method="post" action="/admin/status/login" class="row g-2">
+        <div class="col-auto">
+          <input type="text" name="profile" class="form-control" placeholder="new profile name (e.g. quyen_gmail)" required>
+        </div>
+        <div class="col-auto">
+          <button class="btn btn-primary" type="submit" {% if login_running %}disabled{% endif %}>
+            Add profile &amp; login
+          </button>
+        </div>
+        <div class="col-auto align-self-center">
+          <label class="form-check mb-0" title="Start from a clean browser session so you can pick the right Google account">
+            <input class="form-check-input" type="checkbox" name="fresh" value="1" checked>
+            <span class="form-check-label">fresh (choose account)</span>
+          </label>
+        </div>
+        <div class="col-auto align-self-center text-secondary">
+          Opens a Google login browser window on the server machine; auth is saved to the DB when finished.
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-header"><h3 class="card-title">ComfyUI Instances</h3></div>
+    <div class="table-responsive">
+      <table class="table table-vcenter card-table">
+        <thead><tr><th>Name (model)</th><th>Base URL</th><th>Enabled</th><th>Reachable</th></tr></thead>
+        <tbody>
+          {% for i in instances %}
+          <tr>
+            <td><strong>{{ i.name }}</strong></td>
+            <td><a href="{{ i.base_url }}" target="_blank" rel="noopener">{{ i.base_url }}</a></td>
+            <td>{{ "yes" if i.enabled else "no" }}</td>
+            <td>
+              {% if i.reachable %}<span class="badge bg-green text-green-fg">online</span>
+              {% else %}<span class="badge bg-red text-red-fg">offline</span>{% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="text-secondary">No instances — add rows in “ComfyUI Instances”.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col-md-6">
+      <div class="card mb-3">
+        <div class="card-header"><h3 class="card-title">Requests (last 24h)</h3></div>
+        <div class="table-responsive">
+          <table class="table table-vcenter card-table">
+            <thead><tr><th>Model</th><th>Requests</th><th>Avg latency</th><th>Errors</th></tr></thead>
+            <tbody>
+              {% for s in stats %}
+              <tr>
+                <td>{{ s.model }}</td><td>{{ s.count }}</td>
+                <td>{{ s.avg_ms }} ms</td>
+                <td>{% if s.errors %}<span class="text-red">{{ s.errors }}</span>{% else %}0{% endif %}</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="text-secondary">No requests yet.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="card mb-3">
+        <div class="card-header"><h3 class="card-title">Recent errors (last 24h)</h3></div>
+        <div class="table-responsive">
+          <table class="table table-vcenter card-table">
+            <thead><tr><th>Time</th><th>Endpoint</th><th>Status</th><th>Error</th></tr></thead>
+            <tbody>
+              {% for e in recent_errors %}
+              <tr>
+                <td class="text-nowrap">{{ e.at }}</td>
+                <td>{{ e.endpoint }}</td>
+                <td>{{ e.status }}</td>
+                <td class="text-secondary error-cell">{{ e.error or "" }}</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="text-secondary">No errors. 🎉</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

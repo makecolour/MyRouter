@@ -1,0 +1,220 @@
+"""ComfyUI endpoints — authenticated with per-instance ComfyUI keys.
+
+The instance is bound to the API key; the OpenAI `model` field is optional
+and only validated against the key's instance.
+"""
+
+import base64
+import logging
+import random
+import time
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import Response
+
+from ..comfy import (
+    apply_workflow_placeholders,
+    build_comfy_workflow,
+    comfy_generate,
+    fetch_image_bytes,
+    fetch_instance_info,
+    fetch_queue,
+    resolve_comfy_instance,
+)
+from ..config import settings
+from ..schemas import ImageGenerationRequest, openai_error
+from ..security import AuthContext, describe_error, log_request, require_comfy_auth
+
+logger = logging.getLogger("ai-sidecar.images")
+router = APIRouter()
+
+
+async def _key_instance(ctx: AuthContext):
+    """The comfy_instances row bound to this API key (must be enabled)."""
+    return await resolve_comfy_instance(ctx.comfy_instance)
+
+
+# 9Router "Output Format" aliases (accepted in response_format/output_format).
+_DELIVERY_ALIASES = {
+    "url": "url",
+    "b64_json": "b64",
+    "base64": "b64",
+    "json": "b64",
+    "binary": "binary",
+    "binary_file": "binary",
+    "file": "binary",
+    "raw": "binary",
+}
+
+
+def _delivery_mode(request: ImageGenerationRequest) -> str:
+    value = (request.response_format or request.output_format or "url").strip().lower()
+    mode = _DELIVERY_ALIASES.get(value)
+    if mode is None:
+        raise openai_error(
+            400,
+            f"Invalid response_format '{value}'. Valid values: url, "
+            f"b64_json (aliases: base64, json), binary (aliases: file, "
+            f"binary_file, raw).",
+        )
+    return mode
+
+
+def _parse_size(size: str) -> tuple:
+    normalized = (size or "").strip().lower()
+    if normalized in ("", "auto"):
+        normalized = settings.comfy_default_size.lower()
+    width_str, _, height_str = normalized.partition("x")
+    try:
+        return int(width_str), int(height_str)
+    except ValueError:
+        raise openai_error(
+            400, f"Invalid size '{size}'; expected '<width>x<height>' or 'auto'."
+        )
+
+
+@router.post("/v1/images/generations")
+async def images_generations(
+    request: ImageGenerationRequest,
+    ctx: AuthContext = Depends(require_comfy_auth),
+):
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        response = await _handle(request, ctx)
+        status = 200
+        return response
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(
+            ctx,
+            "/v1/images/generations",
+            request.model or (ctx.comfy_instance if ctx else None),
+            status,
+            started,
+            error,
+        )
+
+
+async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
+    if request.model and request.model.strip() != ctx.comfy_instance:
+        raise openai_error(
+            400,
+            f"This API key is bound to ComfyUI instance "
+            f"'{ctx.comfy_instance}'; it cannot target '{request.model}'.",
+        )
+
+    mode = _delivery_mode(request)
+    width, height = _parse_size(request.size)
+
+    instance = await _key_instance(ctx)
+    base_url = instance.base_url.rstrip("/")
+
+    n = max(1, min(request.n, 4))
+    if mode == "binary":
+        n = 1  # a raw file body can only carry one image
+    logger.info(
+        "images -> ComfyUI '%s' (%s) (n=%d, size=%dx%d, mode=%s)",
+        instance.name,
+        base_url,
+        n,
+        width,
+        height,
+        mode,
+    )
+    urls = []
+    for index in range(n):
+        if request.seed is not None:
+            seed = request.seed + index  # reproducible, distinct per image
+        else:
+            seed = random.randint(0, 2**32 - 1)
+        if request.workflow:
+            workflow = apply_workflow_placeholders(
+                request.workflow, request.prompt, width, height, seed
+            )
+        else:
+            workflow = build_comfy_workflow(
+                request.prompt,
+                width,
+                height,
+                seed,
+                negative_prompt=request.negative_prompt,
+                checkpoint=request.checkpoint,
+                steps=request.steps,
+                cfg=request.cfg,
+                sampler=request.sampler,
+                scheduler=request.scheduler,
+                denoise=request.denoise,
+            )
+        logger.info("ComfyUI generation %d/%d (seed=%d)", index + 1, n, seed)
+        urls.append(await comfy_generate(base_url, workflow))
+
+    if mode == "url":
+        return {"created": int(time.time()), "data": [{"url": url} for url in urls]}
+
+    images = [await fetch_image_bytes(url) for url in urls]
+    if mode == "binary":
+        return Response(content=images[0], media_type="image/png")
+    return {
+        "created": int(time.time()),
+        "data": [
+            {"b64_json": base64.b64encode(image).decode("ascii")} for image in images
+        ],
+    }
+
+
+@router.get("/v1/comfy/info")
+async def comfy_info(ctx: AuthContext = Depends(require_comfy_auth)):
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        info = await fetch_instance_info(instance.base_url)
+        status = 200
+        return {
+            "instance": instance.name,
+            "base_url": instance.base_url,
+            **info,
+        }
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(ctx, "/v1/comfy/info", ctx.comfy_instance, status, started, error)
+
+
+@router.get("/v1/comfy/{instance_name}/info")
+async def comfy_info_named(
+    instance_name: str, ctx: AuthContext = Depends(require_comfy_auth)
+):
+    if instance_name != ctx.comfy_instance:
+        raise openai_error(
+            400,
+            f"This API key is bound to ComfyUI instance "
+            f"'{ctx.comfy_instance}'; it cannot query '{instance_name}'.",
+        )
+    return await comfy_info(ctx)
+
+
+@router.get("/v1/comfy/queue")
+async def comfy_queue(ctx: AuthContext = Depends(require_comfy_auth)):
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        queue = await fetch_queue(instance.base_url)
+        status = 200
+        return {"instance": instance.name, **queue}
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(ctx, "/v1/comfy/queue", ctx.comfy_instance, status, started, error)

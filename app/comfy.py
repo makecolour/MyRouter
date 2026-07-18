@@ -1,0 +1,331 @@
+"""ComfyUI integration: instance resolution (DB), workflow build, generate/poll."""
+
+import asyncio
+import logging
+import time
+import uuid
+from typing import Any, Optional
+from urllib.parse import urlencode
+
+import httpx
+from sqlalchemy import select
+
+from .config import settings
+from .db import SessionLocal
+from .models import ComfyInstance
+from .schemas import openai_error
+
+logger = logging.getLogger("ai-sidecar.comfy")
+
+_http: Optional[httpx.AsyncClient] = None
+
+
+def init_http() -> None:
+    global _http
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+
+
+async def close_http() -> None:
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
+
+
+async def probe_instance(base_url: str) -> bool:
+    """Quick reachability check for the dashboard (tunnels come and go)."""
+    if _http is None:
+        return False
+    try:
+        response = await _http.get(f"{base_url.rstrip('/')}/queue", timeout=3.0)
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def resolve_comfy_instance(model: Optional[str]) -> ComfyInstance:
+    """Map the request's `model` to a comfy_instances row (default: first enabled).
+
+    Queried per request on purpose: the table is the runtime-modifiable list
+    of tunneled ComfyUI sites, so additions/removals apply immediately.
+    """
+    async with SessionLocal() as session:
+        if model:
+            instance = (
+                await session.execute(
+                    select(ComfyInstance).where(
+                        ComfyInstance.name == model,
+                        ComfyInstance.enabled.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
+            if instance is None:
+                names = (
+                    (
+                        await session.execute(
+                            select(ComfyInstance.name)
+                            .where(ComfyInstance.enabled.is_(True))
+                            .order_by(ComfyInstance.name)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                raise openai_error(
+                    404,
+                    f"ComfyUI instance '{model}' not found or disabled. "
+                    f"Available instances: {', '.join(names) or '(none)'}.",
+                    code="model_not_found",
+                )
+            return instance
+
+        instance = (
+            await session.execute(
+                select(ComfyInstance)
+                .where(ComfyInstance.enabled.is_(True))
+                .order_by(ComfyInstance.name)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if instance is None:
+            raise openai_error(
+                503,
+                "No ComfyUI instances configured (comfy_instances table is "
+                "empty or all rows are disabled).",
+                "server_error",
+            )
+        return instance
+
+
+def build_comfy_workflow(
+    prompt: str,
+    width: int,
+    height: int,
+    seed: int,
+    *,
+    negative_prompt: Optional[str] = None,
+    checkpoint: Optional[str] = None,
+    steps: Optional[int] = None,
+    cfg: Optional[float] = None,
+    sampler: Optional[str] = None,
+    scheduler: Optional[str] = None,
+    denoise: Optional[float] = None,
+) -> dict:
+    """Built-in text2img workflow in ComfyUI API format (SD 1.5 / SDXL).
+
+    Every knob falls back to settings/defaults when None; valid values per
+    instance are discoverable via GET /v1/comfy/info.
+    """
+    return {
+        "3": {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": seed,
+                "steps": steps if steps is not None else settings.comfy_steps,
+                "cfg": cfg if cfg is not None else settings.comfy_cfg,
+                "sampler_name": sampler or "euler",
+                "scheduler": scheduler or "normal",
+                "denoise": denoise if denoise is not None else 1.0,
+                "model": ["4", 0],
+                "positive": ["6", 0],
+                "negative": ["7", 0],
+                "latent_image": ["5", 0],
+            },
+        },
+        "4": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": checkpoint or settings.comfy_checkpoint},
+        },
+        "5": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": width, "height": height, "batch_size": 1},
+        },
+        "6": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": prompt, "clip": ["4", 1]},
+        },
+        "7": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": (
+                    negative_prompt
+                    if negative_prompt is not None
+                    else settings.comfy_negative_prompt
+                ),
+                "clip": ["4", 1],
+            },
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
+        },
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["8", 0], "filename_prefix": "sidecar"},
+        },
+    }
+
+
+async def fetch_instance_info(base_url: str) -> dict:
+    """Installed checkpoints/samplers/schedulers of one ComfyUI instance."""
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    base = base_url.rstrip("/")
+    try:
+        ckpt_resp = await _http.get(f"{base}/object_info/CheckpointLoaderSimple")
+        ckpt_resp.raise_for_status()
+        ks_resp = await _http.get(f"{base}/object_info/KSampler")
+        ks_resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"ComfyUI info request failed ({base}): {exc}", "api_error"
+        )
+    try:
+        checkpoints = ckpt_resp.json()["CheckpointLoaderSimple"]["input"]["required"][
+            "ckpt_name"
+        ][0]
+        ksampler_inputs = ks_resp.json()["KSampler"]["input"]["required"]
+        samplers = ksampler_inputs["sampler_name"][0]
+        schedulers = ksampler_inputs["scheduler"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise openai_error(
+            502, f"Unexpected ComfyUI object_info shape ({base}): {exc}", "api_error"
+        )
+    return {
+        "checkpoints": checkpoints,
+        "samplers": samplers,
+        "schedulers": schedulers,
+    }
+
+
+async def fetch_image_bytes(url: str) -> bytes:
+    """Download a generated image from a ComfyUI /view URL (for b64/binary)."""
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    try:
+        response = await _http.get(url)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"Failed to fetch the generated image: {exc}", "api_error"
+        )
+    return response.content
+
+
+async def fetch_queue(base_url: str) -> dict:
+    """Queue depth of one ComfyUI instance."""
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    base = base_url.rstrip("/")
+    try:
+        response = await _http.get(f"{base}/queue")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"ComfyUI queue request failed ({base}): {exc}", "api_error"
+        )
+    data = response.json()
+    return {
+        "running": len(data.get("queue_running", [])),
+        "pending": len(data.get("queue_pending", [])),
+    }
+
+
+def apply_workflow_placeholders(
+    workflow: dict, prompt: str, width: int, height: int, seed: int
+) -> dict:
+    """Substitute placeholders in a caller-supplied ComfyUI workflow.
+
+    A string value that is exactly "{seed}", "{width}" or "{height}" becomes
+    the typed integer; "{prompt}" / "{negative_prompt}" are replaced textually
+    wherever they occur inside string values. A workflow without placeholders
+    is sent as-is (the caller has full control).
+    """
+    typed = {"{seed}": seed, "{width}": width, "{height}": height}
+    textual = {
+        "{prompt}": prompt,
+        "{negative_prompt}": settings.comfy_negative_prompt,
+    }
+
+    def substitute(value: Any) -> Any:
+        if isinstance(value, str):
+            if value in typed:
+                return typed[value]
+            for token, replacement in textual.items():
+                if token in value:
+                    value = value.replace(token, replacement)
+            return value
+        if isinstance(value, dict):
+            return {key: substitute(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [substitute(item) for item in value]
+        return value
+
+    return substitute(workflow)
+
+
+async def comfy_generate(base_url: str, workflow: dict) -> str:
+    """Queue one generation on a ComfyUI instance, poll history, return the URL."""
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+
+    payload = {"prompt": workflow, "client_id": uuid.uuid4().hex}
+
+    try:
+        response = await _http.post(f"{base_url}/prompt", json=payload)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.error("ComfyUI /prompt request failed (%s): %s", base_url, exc)
+        raise openai_error(
+            502, f"ComfyUI /prompt request failed ({base_url}): {exc}", "api_error"
+        )
+
+    prompt_id = response.json().get("prompt_id")
+    if not prompt_id:
+        raise openai_error(
+            502, f"ComfyUI did not return a prompt_id: {response.text}", "api_error"
+        )
+    logger.info("ComfyUI job queued (%s, prompt_id=%s)", base_url, prompt_id)
+
+    deadline = time.monotonic() + settings.comfy_timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(settings.comfy_poll_interval)
+        try:
+            history_response = await _http.get(f"{base_url}/history/{prompt_id}")
+            history_response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning("ComfyUI history poll failed, retrying: %s", exc)
+            continue
+
+        entry = history_response.json().get(prompt_id)
+        if not entry:
+            continue  # still queued/executing
+
+        status = entry.get("status") or {}
+        if status.get("status_str") == "error":
+            logger.error("ComfyUI workflow errored: %s", status)
+            raise openai_error(
+                502,
+                f"ComfyUI workflow failed (prompt_id={prompt_id}). Check that "
+                f"the referenced checkpoints/nodes exist on that instance.",
+                "api_error",
+            )
+
+        for node_output in (entry.get("outputs") or {}).values():
+            for image in node_output.get("images", []):
+                query = urlencode(
+                    {
+                        "filename": image["filename"],
+                        "subfolder": image.get("subfolder", ""),
+                        "type": image.get("type", "output"),
+                    }
+                )
+                url = f"{base_url}/view?{query}"
+                logger.info(
+                    "ComfyUI job complete (prompt_id=%s): %s", prompt_id, url
+                )
+                return url
+
+    raise openai_error(
+        504,
+        f"ComfyUI generation timed out after {settings.comfy_timeout:.0f}s "
+        f"(prompt_id={prompt_id}).",
+        "api_error",
+        "timeout",
+    )
