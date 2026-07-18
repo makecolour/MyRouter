@@ -1,6 +1,8 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
-sqlalchemy[asyncio]>=2.0
+# >=2.0.25: older 2.0.x raises "ping() missing 1 required positional argument
+# 'reconnect'" with aiomysql when pool_pre_ping is enabled
+sqlalchemy[asyncio]>=2.0.25
 aiomysql>=0.2.0
 httpx>=0.27
 pydantic>=2.6
