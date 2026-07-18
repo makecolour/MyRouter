@@ -319,14 +319,24 @@ def _delta_text(output) -> str:
     return ""
 
 
+def _estimate_usage(prompt: str, answer: str) -> dict:
+    """Token estimate (~4 chars/token) — upstream exposes no real counts."""
+    return {
+        "prompt_tokens": max(1, len(prompt) // 4),
+        "completion_tokens": max(1, len(answer) // 4),
+        "total_tokens": max(2, len(prompt) // 4 + len(answer) // 4),
+    }
+
+
 async def _gemini_stream_response(
     request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
 ) -> StreamingResponse:
     """Real token-by-token streaming for Gemini (OpenAI SSE, with usage).
 
-    Client acquisition, session setup, and the first stream item are resolved
-    here so auth/model/conversation errors surface as clean HTTP errors before
-    the 200 stream is committed.
+    Client acquisition + session setup happen up front so auth / unknown-
+    conversation errors are clean HTTP errors. The stream body then flushes
+    the role chunk immediately (low TTFT) and yields content deltas as Gemini
+    produces them.
     """
     model_kwargs = {"model": model} if model.startswith("gemini-") else {}
     conv_id_in = (request.conversation_id or "").strip() or None
@@ -335,15 +345,6 @@ async def _gemini_stream_response(
         session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
             ctx, client, model_kwargs, request, prompt, conv_id_in
         )
-        stream_kwargs = dict(model_kwargs)
-        if session is not None:
-            stream_kwargs["chat"] = session
-        agen = client.generate_content_stream(send_text, **stream_kwargs).__aiter__()
-        # Peek the first item so model/auth errors become clean HTTP errors.
-        try:
-            first_output = await agen.__anext__()
-        except StopAsyncIteration:
-            first_output = None
     except Exception as exc:
         raise _map_gemini_exception(exc, model, ctx.profile_name)
 
@@ -358,20 +359,20 @@ async def _gemini_stream_response(
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         accumulated = ""
+        errored = False
+        # Flush the role chunk right away so routers see the stream start
+        # (low TTFT) instead of waiting for Gemini's first snapshot.
         yield _sse_line(
             chunk_id, created, model, {"role": "assistant", "content": ""},
             conversation_id=conv_id,
         )
         try:
-            if first_output is not None:
-                delta = _delta_text(first_output)
-                if delta:
-                    accumulated += delta
-                    yield _sse_line(
-                        chunk_id, created, model, {"content": delta},
-                        conversation_id=conv_id,
-                    )
-            async for output in agen:
+            stream_kwargs = dict(model_kwargs)
+            if session is not None:
+                stream_kwargs["chat"] = session
+            async for output in client.generate_content_stream(
+                send_text, **stream_kwargs
+            ):
                 delta = _delta_text(output)
                 if delta:
                     accumulated += delta
@@ -379,36 +380,39 @@ async def _gemini_stream_response(
                         chunk_id, created, model, {"content": delta},
                         conversation_id=conv_id,
                     )
-        except Exception:
-            # Mid-stream failure after 200 was committed — close the stream
-            # gracefully with whatever was produced.
-            logger.exception(
-                "Gemini stream failed mid-flight (profile=%s, model=%s)",
-                ctx.profile_name,
-                model,
-            )
-            yield _sse_line(chunk_id, created, model, {}, finish_reason="stop",
-                            conversation_id=conv_id)
-            yield "data: [DONE]\n\n"
-            return
+        except Exception as exc:
+            # 200 already committed — surface the error as content so the
+            # caller sees why, then finish the stream.
+            errored = True
+            mapped = _map_gemini_exception(exc, model, ctx.profile_name)
+            message = mapped.detail.get("error", {}).get("message", str(exc)) \
+                if isinstance(mapped.detail, dict) else str(exc)
+            logger.warning("Gemini stream error (model=%s): %s", model, message)
+            if not accumulated:
+                yield _sse_line(
+                    chunk_id, created, model, {"content": f"[error] {message}"},
+                    conversation_id=conv_id,
+                )
 
-        if conv_id:
+        if conv_id and not errored:
             try:
                 await _persist_conversation(is_new, conv_id, ctx, model, session, title)
             except Exception:
                 logger.warning("Failed to persist conversation %s", conv_id)
 
+        # Usage goes ON the finish chunk (not a separate trailing chunk): many
+        # routers treat finish_reason="stop" as end-of-stream and ignore any
+        # later chunk, so a trailing usage chunk would be dropped → IN/OUT 0.
+        usage = _estimate_usage(prompt, accumulated)
         yield _sse_line(chunk_id, created, model, {}, finish_reason="stop",
-                        conversation_id=conv_id)
-        # Usage chunk (choices:[]) so routers can count tokens — ~4 chars/token.
-        usage = {
-            "prompt_tokens": max(1, len(prompt) // 4),
-            "completion_tokens": max(1, len(accumulated) // 4),
-            "total_tokens": max(2, len(prompt) // 4 + len(accumulated) // 4),
-        }
-        yield _sse_line(chunk_id, created, model, {}, usage=usage,
-                        conversation_id=conv_id, choices=False)
+                        conversation_id=conv_id, usage=usage)
         yield "data: [DONE]\n\n"
+        logger.info(
+            "stream done (model=%s): %d chars, usage=%s",
+            model,
+            len(accumulated),
+            usage,
+        )
 
     return StreamingResponse(body(), media_type="text/event-stream")
 

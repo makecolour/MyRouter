@@ -162,18 +162,16 @@ def sse_chunks(
             payload["conversation_id"] = conversation_id
         return f"data: {json.dumps(payload)}\n\n"
 
+    usage = {
+        "prompt_tokens": max(1, len(prompt) // 4),
+        "completion_tokens": max(1, len(answer) // 4),
+        "total_tokens": max(2, len(prompt) // 4 + len(answer) // 4),
+    }
     yield chunk({"role": "assistant", "content": ""})
     yield chunk({"content": answer})
-    yield chunk({}, finish_reason="stop")
-    yield chunk(
-        {},
-        usage={
-            "prompt_tokens": max(1, len(prompt) // 4),
-            "completion_tokens": max(1, len(answer) // 4),
-            "total_tokens": max(2, len(prompt) // 4 + len(answer) // 4),
-        },
-        choices=False,
-    )
+    # Usage ON the finish chunk — routers that stop at finish_reason would
+    # drop a trailing usage-only chunk (see chat._gemini_stream_response).
+    yield chunk({}, finish_reason="stop", usage=usage)
     yield "data: [DONE]\n\n"
 
 
