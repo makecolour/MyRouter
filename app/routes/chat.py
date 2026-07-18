@@ -11,12 +11,13 @@ message is sent); the response carries `conversation_id` back.
 """
 
 import copy
+import json
 import logging
 import time
 import uuid
 from typing import Optional, Tuple
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from gemini_webapi import (
     APIError,
@@ -79,8 +80,16 @@ async def _handle(request: ChatCompletionRequest, ctx: AuthContext):
             400, "Model must be 'gemini', 'gemini-*' or a NotebookLM notebook id."
         )
 
+    is_gemini = model == "gemini" or model.startswith("gemini-")
+
+    # Real token streaming for Gemini (low TTFT, incremental deltas) — this is
+    # what OpenAI-compatible routers like 9Router expect. NotebookLM's ask()
+    # is not streamable, so it falls through to the single-chunk fake SSE.
+    if request.stream and is_gemini:
+        return await _gemini_stream_response(request, ctx, model, prompt)
+
     conversation_id: Optional[str] = None
-    if model == "gemini" or model.startswith("gemini-"):
+    if is_gemini:
         answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
     else:
         answer = await _notebook_chat(ctx, model, prompt)
@@ -95,10 +104,10 @@ def _chat_response(
     answer: str,
     conversation_id: Optional[str] = None,
 ):
-    """OpenAI response assembly shared by all chat surfaces (stream + JSON)."""
+    """OpenAI response assembly shared by non-streaming + NotebookLM streaming."""
     if request.stream:
         return StreamingResponse(
-            sse_chunks(model, answer, conversation_id),
+            sse_chunks(model, prompt, answer, conversation_id),
             media_type="text/event-stream",
         )
     payload = build_chat_response(model, prompt, answer)
@@ -130,142 +139,278 @@ def _fresh_session(client, model_kwargs: dict, metadata=None):
     return session
 
 
-async def _gemini_chat(
-    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
-) -> Tuple[str, Optional[str]]:
-    model_kwargs = {"model": model} if model.startswith("gemini-") else {}
-    conv_id = (request.conversation_id or "").strip() or None
-
-    try:
-        client = await get_gemini_client(ctx.profile_name)
-        if conv_id is None:
-            # Stateless: the whole (flattened) history in one prompt.
-            logger.info(
-                "chat -> Gemini (profile=%s, model=%s)", ctx.profile_name, model
-            )
-            result = await client.generate_content(prompt, **model_kwargs)
-            return extract_text(result), None
-
-        message = last_user_message(request.messages) or prompt
-
-        if conv_id == "new":
-            session = _fresh_session(client, model_kwargs)
-            conv_id = f"conv-{uuid.uuid4().hex}"
-            logger.info(
-                "chat -> Gemini new conversation %s (profile=%s, model=%s)",
-                conv_id,
-                ctx.profile_name,
-                model,
-            )
-            result = await session.send_message(message)
-            answer = extract_text(result)
-            async with SessionLocal() as db:
-                db.add(
-                    GeminiConversation(
-                        id=conv_id,
-                        profile_name=ctx.profile_name,
-                        model=model,
-                        title=message[:250],
-                        chat_metadata=session.metadata,
-                    )
-                )
-                await db.commit()
-            return answer, conv_id
-
-        # Continue an existing conversation.
-        async with SessionLocal() as db:
-            row = (
-                await db.execute(
-                    select(GeminiConversation).where(
-                        GeminiConversation.id == conv_id,
-                        GeminiConversation.profile_name == ctx.profile_name,
-                    )
-                )
-            ).scalar_one_or_none()
-        if row is None:
-            raise openai_error(
-                404,
-                f"Conversation '{conv_id}' was not found for this API key. "
-                f"Pass conversation_id='new' to start one.",
-                code="conversation_not_found",
-            )
-        logger.info(
-            "chat -> Gemini conversation %s (profile=%s, model=%s)",
-            conv_id,
-            ctx.profile_name,
-            model,
-        )
-        session = _fresh_session(client, model_kwargs, metadata=row.chat_metadata)
-        result = await session.send_message(message)
-        answer = extract_text(result)
-        async with SessionLocal() as db:
-            row = await db.get(GeminiConversation, conv_id)
-            if row is not None:
-                row.chat_metadata = session.metadata
-                row.model = model
-                row.updated_at = utcnow()
-                await db.commit()
-        return answer, conv_id
-
-    except ModelInvalid:
-        raise openai_error(
+def _map_gemini_exception(exc: Exception, model: str, profile: str) -> HTTPException:
+    """Translate a gemini_webapi exception into an OpenAI-shaped HTTPException."""
+    if isinstance(exc, HTTPException):  # our own errors pass through
+        return exc
+    if isinstance(exc, ModelInvalid):
+        return openai_error(
             404,
             f"Gemini model '{model}' is invalid or unavailable for this "
             f"account. List valid models via GET /v1/models.",
             code="model_not_found",
         )
-    except ValueError as exc:
-        # gemini_webapi raises a plain ValueError ("Unknown model name: …")
-        # for an unrecognized model string.
-        if "model name" in str(exc).lower():
-            raise openai_error(
-                404,
-                f"Gemini model '{model}' is invalid or unavailable for this "
-                f"account. List valid models via GET /v1/models.",
-                code="model_not_found",
-            )
-        raise openai_error(502, f"Gemini request failed: {exc}", "api_error")
-    except UsageLimitExceeded as exc:
-        raise openai_error(
+    if isinstance(exc, ValueError) and "model name" in str(exc).lower():
+        return openai_error(
+            404,
+            f"Gemini model '{model}' is invalid or unavailable for this "
+            f"account. List valid models via GET /v1/models.",
+            code="model_not_found",
+        )
+    if isinstance(exc, UsageLimitExceeded):
+        return openai_error(
             429,
             f"Gemini usage limit exceeded for model '{model}': {exc}",
             "rate_limit_error",
             "rate_limit_exceeded",
         )
-    except TemporarilyBlocked as exc:
-        raise openai_error(
+    if isinstance(exc, TemporarilyBlocked):
+        return openai_error(
             429,
             f"Google temporarily blocked this account's requests: {exc}",
             "rate_limit_error",
             "temporarily_blocked",
         )
-    except GeminiTimeoutError as exc:
-        raise openai_error(
+    if isinstance(exc, GeminiTimeoutError):
+        return openai_error(
             504,
             f"Gemini request timed out: {str(exc) or 'no response in time'}",
             "api_error",
             "timeout",
         )
-    except (APIError, GeminiError) as exc:
-        logger.exception(
-            "Gemini API error (profile=%s, model=%s)", ctx.profile_name, model
-        )
+    logger.exception("Gemini request failed (profile=%s, model=%s)", profile, model)
+    return openai_error(
+        502, f"Gemini request failed: {str(exc) or type(exc).__name__}", "api_error"
+    )
+
+
+async def _prepare_gemini_session(
+    ctx: AuthContext,
+    client,
+    model_kwargs: dict,
+    request: ChatCompletionRequest,
+    prompt: str,
+    conv_id_in: Optional[str],
+):
+    """Resolve the chat session + what to send.
+
+    Returns (session_or_None, send_text, conv_id_or_None, is_new, title).
+    session None => stateless (send the flattened prompt). Raises a clean 404
+    for an unknown conversation id.
+    """
+    if conv_id_in is None:
+        return None, prompt, None, False, None
+
+    message = last_user_message(request.messages) or prompt
+    if conv_id_in == "new":
+        session = _fresh_session(client, model_kwargs)
+        return session, message, f"conv-{uuid.uuid4().hex}", True, message[:250]
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(
+                select(GeminiConversation).where(
+                    GeminiConversation.id == conv_id_in,
+                    GeminiConversation.profile_name == ctx.profile_name,
+                )
+            )
+        ).scalar_one_or_none()
+    if row is None:
         raise openai_error(
-            502,
-            f"Gemini request failed: {str(exc) or type(exc).__name__}",
-            "api_error",
+            404,
+            f"Conversation '{conv_id_in}' was not found for this API key. "
+            f"Pass conversation_id='new' to start one.",
+            code="conversation_not_found",
         )
+    session = _fresh_session(client, model_kwargs, metadata=row.chat_metadata)
+    return session, message, conv_id_in, False, None
+
+
+async def _persist_conversation(
+    is_new: bool,
+    conv_id: str,
+    ctx: AuthContext,
+    model: str,
+    session,
+    title: Optional[str],
+) -> None:
+    """Save the server-side conversation metadata after a turn completes."""
+    async with SessionLocal() as db:
+        if is_new:
+            db.add(
+                GeminiConversation(
+                    id=conv_id,
+                    profile_name=ctx.profile_name,
+                    model=model,
+                    title=title,
+                    chat_metadata=session.metadata,
+                )
+            )
+        else:
+            row = await db.get(GeminiConversation, conv_id)
+            if row is not None:
+                row.chat_metadata = session.metadata
+                row.model = model
+                row.updated_at = utcnow()
+        await db.commit()
+
+
+async def _gemini_chat(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
+) -> Tuple[str, Optional[str]]:
+    model_kwargs = {"model": model} if model.startswith("gemini-") else {}
+    conv_id_in = (request.conversation_id or "").strip() or None
+    try:
+        client = await get_gemini_client(ctx.profile_name)
+        session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
+            ctx, client, model_kwargs, request, prompt, conv_id_in
+        )
+        logger.info(
+            "chat -> Gemini (profile=%s, model=%s, conversation=%s)",
+            ctx.profile_name,
+            model,
+            conv_id or "stateless",
+        )
+        if session is None:
+            result = await client.generate_content(send_text, **model_kwargs)
+        else:
+            result = await session.send_message(send_text)
+        answer = extract_text(result)
+        if conv_id:
+            await _persist_conversation(is_new, conv_id, ctx, model, session, title)
+        return answer, conv_id
     except Exception as exc:
-        if hasattr(exc, "status_code"):  # our own HTTPExceptions pass through
-            raise
-        logger.exception(
-            "Gemini request failed (profile=%s, model=%s)", ctx.profile_name, model
+        raise _map_gemini_exception(exc, model, ctx.profile_name)
+
+
+def _sse_line(
+    chunk_id: str,
+    created: int,
+    model: str,
+    delta: dict,
+    finish_reason: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    usage: Optional[dict] = None,
+    choices: bool = True,
+) -> str:
+    payload = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": (
+            [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+            if choices
+            else []
+        ),
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _delta_text(output) -> str:
+    """New characters from a streamed ModelOutput (text_delta, cumulative fb)."""
+    delta = getattr(output, "text_delta", None)
+    if isinstance(delta, str):
+        return delta
+    return ""
+
+
+async def _gemini_stream_response(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
+) -> StreamingResponse:
+    """Real token-by-token streaming for Gemini (OpenAI SSE, with usage).
+
+    Client acquisition, session setup, and the first stream item are resolved
+    here so auth/model/conversation errors surface as clean HTTP errors before
+    the 200 stream is committed.
+    """
+    model_kwargs = {"model": model} if model.startswith("gemini-") else {}
+    conv_id_in = (request.conversation_id or "").strip() or None
+    try:
+        client = await get_gemini_client(ctx.profile_name)
+        session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
+            ctx, client, model_kwargs, request, prompt, conv_id_in
         )
-        raise openai_error(
-            502,
-            f"Gemini request failed: {str(exc) or type(exc).__name__}",
-            "api_error",
+        stream_kwargs = dict(model_kwargs)
+        if session is not None:
+            stream_kwargs["chat"] = session
+        agen = client.generate_content_stream(send_text, **stream_kwargs).__aiter__()
+        # Peek the first item so model/auth errors become clean HTTP errors.
+        try:
+            first_output = await agen.__anext__()
+        except StopAsyncIteration:
+            first_output = None
+    except Exception as exc:
+        raise _map_gemini_exception(exc, model, ctx.profile_name)
+
+    logger.info(
+        "chat (stream) -> Gemini (profile=%s, model=%s, conversation=%s)",
+        ctx.profile_name,
+        model,
+        conv_id or "stateless",
+    )
+
+    async def body():
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        accumulated = ""
+        yield _sse_line(
+            chunk_id, created, model, {"role": "assistant", "content": ""},
+            conversation_id=conv_id,
         )
+        try:
+            if first_output is not None:
+                delta = _delta_text(first_output)
+                if delta:
+                    accumulated += delta
+                    yield _sse_line(
+                        chunk_id, created, model, {"content": delta},
+                        conversation_id=conv_id,
+                    )
+            async for output in agen:
+                delta = _delta_text(output)
+                if delta:
+                    accumulated += delta
+                    yield _sse_line(
+                        chunk_id, created, model, {"content": delta},
+                        conversation_id=conv_id,
+                    )
+        except Exception:
+            # Mid-stream failure after 200 was committed — close the stream
+            # gracefully with whatever was produced.
+            logger.exception(
+                "Gemini stream failed mid-flight (profile=%s, model=%s)",
+                ctx.profile_name,
+                model,
+            )
+            yield _sse_line(chunk_id, created, model, {}, finish_reason="stop",
+                            conversation_id=conv_id)
+            yield "data: [DONE]\n\n"
+            return
+
+        if conv_id:
+            try:
+                await _persist_conversation(is_new, conv_id, ctx, model, session, title)
+            except Exception:
+                logger.warning("Failed to persist conversation %s", conv_id)
+
+        yield _sse_line(chunk_id, created, model, {}, finish_reason="stop",
+                        conversation_id=conv_id)
+        # Usage chunk (choices:[]) so routers can count tokens — ~4 chars/token.
+        usage = {
+            "prompt_tokens": max(1, len(prompt) // 4),
+            "completion_tokens": max(1, len(accumulated) // 4),
+            "total_tokens": max(2, len(prompt) // 4 + len(accumulated) // 4),
+        }
+        yield _sse_line(chunk_id, created, model, {}, usage=usage,
+                        conversation_id=conv_id, choices=False)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(body(), media_type="text/event-stream")
 
 
 @router.get("/v1/conversations")

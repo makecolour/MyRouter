@@ -126,22 +126,38 @@ def build_chat_response(model: str, prompt: str, answer: str) -> dict:
 
 
 def sse_chunks(
-    model: str, answer: str, conversation_id: Optional[str] = None
+    model: str,
+    prompt: str,
+    answer: str,
+    conversation_id: Optional[str] = None,
 ) -> Iterator[str]:
-    """Fake SSE stream: the full answer in one content chunk, then [DONE]."""
+    """Single-answer SSE stream (NotebookLM ask() is not streamable).
+
+    Emits the full answer in one content chunk, a finish chunk, then a usage
+    chunk (choices:[]) so OpenAI-compatible routers can count tokens.
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
-    def chunk(delta: dict, finish_reason: Optional[str] = None) -> str:
+    def chunk(
+        delta: dict,
+        finish_reason: Optional[str] = None,
+        usage: Optional[dict] = None,
+        choices: bool = True,
+    ) -> str:
         payload = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [
-                {"index": 0, "delta": delta, "finish_reason": finish_reason}
-            ],
+            "choices": (
+                [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+                if choices
+                else []
+            ),
         }
+        if usage is not None:
+            payload["usage"] = usage
         if conversation_id:
             payload["conversation_id"] = conversation_id
         return f"data: {json.dumps(payload)}\n\n"
@@ -149,6 +165,15 @@ def sse_chunks(
     yield chunk({"role": "assistant", "content": ""})
     yield chunk({"content": answer})
     yield chunk({}, finish_reason="stop")
+    yield chunk(
+        {},
+        usage={
+            "prompt_tokens": max(1, len(prompt) // 4),
+            "completion_tokens": max(1, len(answer) // 4),
+            "total_tokens": max(2, len(prompt) // 4 + len(answer) // 4),
+        },
+        choices=False,
+    )
     yield "data: [DONE]\n\n"
 
 

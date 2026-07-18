@@ -7,7 +7,13 @@ from fastapi import APIRouter, Depends
 
 from ..schemas import ChatCompletionRequest, flatten_messages, openai_error
 from ..security import AuthContext, describe_error, log_request, require_google_auth
-from .chat import _chat_response, _gemini_chat, delete_conversation, list_conversations
+from .chat import (
+    _chat_response,
+    _gemini_chat,
+    _gemini_stream_response,
+    delete_conversation,
+    list_conversations,
+)
 from .models_list import gemini_model_entries
 
 logger = logging.getLogger("ai-sidecar.gemini-api")
@@ -52,8 +58,11 @@ async def gemini_chat_completions(
                 f"notebooks.",
                 code="model_not_found",
             )
-        answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
-        response = _chat_response(request, model, prompt, answer, conversation_id)
+        if request.stream:
+            response = await _gemini_stream_response(request, ctx, model, prompt)
+        else:
+            answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
+            response = _chat_response(request, model, prompt, answer, conversation_id)
         status = 200
         return response
     except Exception as exc:
