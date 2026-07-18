@@ -1,11 +1,17 @@
 """Application settings (env vars / .env via pydantic-settings)."""
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Anchor .env to the project root so it loads no matter which directory the
+# server is started from (real environment variables still take precedence).
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=str(_ENV_FILE), env_file_encoding="utf-8", extra="ignore"
     )
 
     database_url: str = "mysql+aiomysql://root:@localhost:3306/myrouter"
