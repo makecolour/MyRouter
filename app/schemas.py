@@ -1,9 +1,12 @@
 """OpenAI-compatible request/response schemas and helpers."""
 
+import base64
+import binascii
 import json
+import mimetypes
 import time
 import uuid
-from typing import Any, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -40,6 +43,9 @@ class ChatCompletionRequest(BaseModel):
     # existing id continues it (only the last user message is sent). Absent ->
     # stateless (history flattened into one prompt).
     conversation_id: Optional[str] = None
+    # Function calling (Gemini-only, prompt-emulated). Standard OpenAI shapes.
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Any] = None
 
 
 class ImageGenerationRequest(BaseModel):
@@ -95,34 +101,120 @@ def last_user_message(messages: List[ChatMessage]) -> Optional[str]:
     return None
 
 
+_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/bmp": ".bmp",
+}
+
+
+def _ext_for_mime(mime: str) -> str:
+    mime = (mime or "").split(";")[0].strip().lower()
+    return _MIME_EXT.get(mime) or mimetypes.guess_extension(mime) or ".bin"
+
+
+def extract_images(content: Any) -> List[Dict[str, Any]]:
+    """Pull OpenAI `image_url` parts from a message's content.
+
+    Returns image sources: `{"data": bytes, "ext": str}` for `data:` URIs
+    (decoded here), or `{"url": str}` for http(s) URLs (fetched later in the
+    request path where the shared httpx client lives). Non-image content is
+    ignored.
+    """
+    if not isinstance(content, list):
+        return []
+    images: List[Dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        url = (part.get("image_url") or {}).get("url", "")
+        if not isinstance(url, str) or not url:
+            continue
+        if url.startswith("data:"):
+            header, _, b64 = url[len("data:") :].partition(",")
+            mime = header.split(";")[0]
+            try:
+                data = base64.b64decode(b64, validate=False)
+            except (binascii.Error, ValueError):
+                raise openai_error(400, "Invalid base64 image data in image_url.")
+            images.append({"data": data, "ext": _ext_for_mime(mime)})
+        elif url.startswith(("http://", "https://")):
+            images.append({"url": url})
+    return images
+
+
+def collect_images(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+    """Images from the last user message (the current turn)."""
+    for message in reversed(messages):
+        if message.role == "user":
+            return extract_images(message.content)
+    return []
+
+
 def flatten_messages(messages: List[ChatMessage]) -> str:
-    """Collapse an OpenAI message array into a single prompt string."""
+    """Collapse an OpenAI message array into a single prompt string.
+
+    Renders the function-calling round-trip so the model keeps context:
+    assistant `tool_calls` and `role:"tool"` results become readable lines.
+    """
     lines = []
     for message in messages:
+        role = message.role
+        tool_calls = getattr(message, "tool_calls", None)
+        if role == "assistant" and tool_calls:
+            rendered = []
+            for tc in tool_calls:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                rendered.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
+            lines.append(f"assistant: [called tools: {'; '.join(rendered)}]")
+            text = _content_to_text(message.content).strip()
+            if text:
+                lines.append(f"assistant: {text}")
+            continue
+        if role == "tool":
+            tcid = getattr(message, "tool_call_id", None)
+            text = _content_to_text(message.content).strip()
+            label = f"tool result[{tcid}]" if tcid else "tool result"
+            lines.append(f"{label}: {text}")
+            continue
         text = _content_to_text(message.content).strip()
         if text:
-            lines.append(f"{message.role}: {text}")
+            lines.append(f"{role}: {text}")
     return "\n\n".join(lines)
 
 
-def build_chat_response(model: str, prompt: str, answer: str) -> dict:
+def build_chat_response(
+    model: str,
+    prompt: str,
+    answer: str,
+    tool_calls: Optional[List[dict]] = None,
+) -> dict:
+    message: Dict[str, Any] = {"role": "assistant"}
+    if tool_calls:
+        message["content"] = None
+        message["tool_calls"] = tool_calls
+        finish = "tool_calls"
+        completion_chars = len(json.dumps(tool_calls))
+    else:
+        message["content"] = answer
+        finish = "stop"
+        completion_chars = len(answer)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         # The upstream services expose no token counts; estimate ~4 chars/token.
         "usage": {
             "prompt_tokens": max(1, len(prompt) // 4),
-            "completion_tokens": max(1, len(answer) // 4),
-            "total_tokens": max(2, len(prompt) // 4 + len(answer) // 4),
+            "completion_tokens": max(1, completion_chars // 4),
+            "total_tokens": max(2, len(prompt) // 4 + completion_chars // 4),
         },
     }
 

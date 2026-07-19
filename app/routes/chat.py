@@ -13,9 +13,13 @@ message is sent); the response carries `conversation_id` back.
 import copy
 import json
 import logging
+import mimetypes
+import os
+import tempfile
 import time
 import uuid
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -31,6 +35,7 @@ from gemini_webapi.constants import DEFAULT_METADATA as GEMINI_DEFAULT_METADATA
 from notebooklm import NotebookNotFoundError
 from sqlalchemy import select
 
+from ..comfy import fetch_image_bytes
 from ..config import settings
 from ..db import SessionLocal
 from ..models import GeminiConversation, utcnow
@@ -38,6 +43,7 @@ from ..pool import get_gemini_client, get_notebook_client, notebook_locks
 from ..schemas import (
     ChatCompletionRequest,
     build_chat_response,
+    collect_images,
     extract_text,
     flatten_messages,
     last_user_message,
@@ -45,6 +51,12 @@ from ..schemas import (
     sse_chunks,
 )
 from ..security import AuthContext, describe_error, log_request, require_google_auth
+from ..tools import (
+    build_tool_instruction,
+    parse_tool_calls,
+    tool_names,
+    tools_requested,
+)
 
 logger = logging.getLogger("ai-sidecar.chat")
 router = APIRouter()
@@ -83,18 +95,38 @@ async def _handle(request: ChatCompletionRequest, ctx: AuthContext):
 
     is_gemini = model == "gemini" or model.startswith("gemini-")
 
-    # Real token streaming for Gemini (low TTFT, incremental deltas) — this is
-    # what OpenAI-compatible routers like 9Router expect. NotebookLM's ask()
-    # is not streamable, so it falls through to the single-chunk fake SSE.
-    if request.stream and is_gemini:
+    if is_gemini:
+        return await gemini_chat_dispatch(request, ctx, model, prompt)
+
+    # NotebookLM: not streamable; single-answer fake SSE when stream requested.
+    answer = await _notebook_chat(ctx, model, prompt)
+    return _chat_response(request, model, prompt, answer)
+
+
+async def gemini_chat_dispatch(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
+):
+    """Route a Gemini request across tools / streaming / plain chat.
+
+    Shared by the legacy /v1 surface and /gemini/v1 so both get the same
+    tool-calling + streaming behavior.
+    """
+    if tools_requested(request.tools, request.tool_choice) and settings.tool_emulation:
+        cleaned, conv_id, tool_calls = await _gemini_chat_tools(
+            request, ctx, model, prompt
+        )
+        if request.stream:
+            return _tool_stream_response(model, prompt, cleaned, tool_calls, conv_id)
+        payload = build_chat_response(model, prompt, cleaned, tool_calls=tool_calls)
+        if conv_id:
+            payload["conversation_id"] = conv_id
+        return payload
+
+    # Real token streaming for Gemini (low TTFT) — what OpenAI routers expect.
+    if request.stream:
         return await _gemini_stream_response(request, ctx, model, prompt)
 
-    conversation_id: Optional[str] = None
-    if is_gemini:
-        answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
-    else:
-        answer = await _notebook_chat(ctx, model, prompt)
-
+    answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
     return _chat_response(request, model, prompt, answer, conversation_id)
 
 
@@ -256,6 +288,49 @@ async def _persist_conversation(
         await db.commit()
 
 
+async def _prepare_vision_files(request: ChatCompletionRequest) -> List[Path]:
+    """Materialize the request's input images to temp files with the right
+    extension (gemini_webapi derives the upload MIME from the filename).
+
+    The caller MUST unlink the returned paths after the model call.
+    """
+    sources = collect_images(request.messages)
+    if not sources:
+        return []
+    limit = int(settings.vision_max_image_mb * 1024 * 1024)
+    paths: List[Path] = []
+    try:
+        for src in sources:
+            if "data" in src:
+                data, ext = src["data"], src["ext"]
+            else:
+                data = await fetch_image_bytes(src["url"])
+                mime = mimetypes.guess_type(src["url"])[0] or "image/jpeg"
+                ext = mimetypes.guess_extension(mime) or ".jpg"
+            if len(data) > limit:
+                raise openai_error(
+                    400,
+                    f"Input image exceeds the "
+                    f"{settings.vision_max_image_mb:.0f} MB limit.",
+                )
+            fd, tmp = tempfile.mkstemp(prefix="myrouter_img_", suffix=ext)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            paths.append(Path(tmp))
+        return paths
+    except Exception:
+        _cleanup_files(paths)
+        raise
+
+
+def _cleanup_files(paths: List[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 async def _gemini_chat(
     request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
 ) -> Tuple[str, Optional[str]]:
@@ -266,20 +341,71 @@ async def _gemini_chat(
         session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
             ctx, client, model_kwargs, request, prompt, conv_id_in
         )
+        files = await _prepare_vision_files(request)
         logger.info(
-            "chat -> Gemini (profile=%s, model=%s, conversation=%s)",
+            "chat -> Gemini (profile=%s, model=%s, conversation=%s, images=%d)",
             ctx.profile_name,
             model,
             conv_id or "stateless",
+            len(files),
         )
-        if session is None:
-            result = await client.generate_content(send_text, **model_kwargs)
-        else:
-            result = await session.send_message(send_text)
+        try:
+            if session is None:
+                result = await client.generate_content(
+                    send_text, files=files or None, **model_kwargs
+                )
+            else:
+                result = await session.send_message(send_text, files=files or None)
+        finally:
+            _cleanup_files(files)
         answer = extract_text(result)
         if conv_id:
             await _persist_conversation(is_new, conv_id, ctx, model, session, title)
         return answer, conv_id
+    except Exception as exc:
+        raise _map_gemini_exception(exc, model, ctx.profile_name)
+
+
+async def _gemini_chat_tools(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
+) -> Tuple[str, Optional[str], Optional[List[dict]]]:
+    """Prompt-emulated function calling: inject tool schemas, run non-stream
+    (parsing needs the full text), parse the reply into OpenAI tool_calls.
+
+    Returns (text, conv_id, tool_calls_or_None).
+    """
+    model_kwargs = {"model": model} if model.startswith("gemini-") else {}
+    conv_id_in = (request.conversation_id or "").strip() or None
+    instruction = build_tool_instruction(request.tools, request.tool_choice)
+    try:
+        client = await get_gemini_client(ctx.profile_name)
+        session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
+            ctx, client, model_kwargs, request, prompt, conv_id_in
+        )
+        # Prepend the tool protocol to whatever gets sent (flattened prompt for
+        # stateless, the last user message for a conversation).
+        send_text = instruction + "\n\n" + send_text
+        files = await _prepare_vision_files(request)
+        logger.info(
+            "chat -> Gemini tools (profile=%s, model=%s, tools=%d)",
+            ctx.profile_name,
+            model,
+            len(request.tools or []),
+        )
+        try:
+            if session is None:
+                result = await client.generate_content(
+                    send_text, files=files or None, **model_kwargs
+                )
+            else:
+                result = await session.send_message(send_text, files=files or None)
+        finally:
+            _cleanup_files(files)
+        text = extract_text(result)
+        if conv_id:
+            await _persist_conversation(is_new, conv_id, ctx, model, session, title)
+        calls, cleaned = parse_tool_calls(text, tool_names(request.tools))
+        return cleaned, conv_id, calls
     except Exception as exc:
         raise _map_gemini_exception(exc, model, ctx.profile_name)
 
@@ -346,14 +472,16 @@ async def _gemini_stream_response(
         session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
             ctx, client, model_kwargs, request, prompt, conv_id_in
         )
+        files = await _prepare_vision_files(request)
     except Exception as exc:
         raise _map_gemini_exception(exc, model, ctx.profile_name)
 
     logger.info(
-        "chat (stream) -> Gemini (profile=%s, model=%s, conversation=%s)",
+        "chat (stream) -> Gemini (profile=%s, model=%s, conversation=%s, images=%d)",
         ctx.profile_name,
         model,
         conv_id or "stateless",
+        len(files),
     )
 
     async def body():
@@ -372,7 +500,7 @@ async def _gemini_stream_response(
             if session is not None:
                 stream_kwargs["chat"] = session
             async for output in client.generate_content_stream(
-                send_text, **stream_kwargs
+                send_text, files=files or None, **stream_kwargs
             ):
                 delta = _delta_text(output)
                 if delta:
@@ -394,6 +522,8 @@ async def _gemini_stream_response(
                     chunk_id, created, model, {"content": f"[error] {message}"},
                     conversation_id=conv_id,
                 )
+        finally:
+            _cleanup_files(files)
 
         if conv_id and not errored:
             try:
@@ -415,6 +545,62 @@ async def _gemini_stream_response(
             len(accumulated),
             usage,
         )
+
+    return StreamingResponse(body(), media_type="text/event-stream")
+
+
+def _tool_stream_response(
+    model: str,
+    prompt: str,
+    cleaned: str,
+    tool_calls: Optional[List[dict]],
+    conv_id: Optional[str],
+) -> StreamingResponse:
+    """Synthetic SSE for the stream + tools case.
+
+    Tool-call parsing needs the full text, so the model call already ran
+    non-stream; here we replay the result as a valid OpenAI stream (role →
+    tool_calls OR content → finish + usage → [DONE]).
+    """
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    def body():
+        yield _sse_line(
+            chunk_id, created, model, {"role": "assistant", "content": None},
+            conversation_id=conv_id,
+        )
+        if tool_calls:
+            delta_calls = [
+                {
+                    "index": i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    },
+                }
+                for i, tc in enumerate(tool_calls)
+            ]
+            yield _sse_line(
+                chunk_id, created, model, {"tool_calls": delta_calls},
+                conversation_id=conv_id,
+            )
+            finish = "tool_calls"
+            usage = _estimate_usage(prompt, json.dumps(tool_calls))
+        else:
+            if cleaned:
+                yield _sse_line(
+                    chunk_id, created, model, {"content": cleaned},
+                    conversation_id=conv_id,
+                )
+            finish = "stop"
+            usage = _estimate_usage(prompt, cleaned)
+        yield _sse_line(chunk_id, created, model, {}, finish_reason=finish,
+                        conversation_id=conv_id, usage=usage)
+        if settings.sse_include_done:
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(body(), media_type="text/event-stream")
 

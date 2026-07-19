@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # sentinel into its non-stream aggregated JSON.
     sse_include_done: bool = True
 
+    # Vision: max size (MB) per input image; larger -> 400.
+    vision_max_image_mb: float = 20.0
+    # Function calling for Gemini is prompt-EMULATED (the web backend has no
+    # native tool API). False -> ignore `tools` and answer as plain chat.
+    tool_emulation: bool = True
+
     log_level: str = "INFO"
 
 
