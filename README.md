@@ -164,9 +164,12 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 ### Năng lực chat (Gemini)
 
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
-- **Ảnh trong response** (Gemini trả về): web images (URL công khai) + generated images (Gemini tạo — sidecar tải kèm cookie phiên, nhúng base64) được đưa vào `message.images` (`[{url, title, alt, kind}]`); playground render `<img>`. Field ngoài chuẩn OpenAI nên SDK thường bỏ qua an toàn.
+- **Vision** (ảnh input `image_url`): **chạy được** — sidecar tách part ảnh, ghi file tạm đúng MIME, truyền vào Gemini (`VISION_MAX_IMAGE_MB` giới hạn kích thước). Khi account bị Google rate-limit tạm thời có thể gặp `APIError 1096/1100` (thử lại sau).
+- **Ảnh trong response** (Gemini trả về) → `message.images` (`[{url, title, alt, kind}]`), playground render `<img>`:
+  - **web images** (URL công khai): hiển thị bình thường.
+  - **generated images** (Gemini tự tạo): sidecar cố tải kèm session, nhưng Google **thường 403** URL ảnh generated qua đường web reverse-engineer (giới hạn upstream) → hiện placeholder "không tải được". Ảnh generated đáng tin cần Gemini API chính thức.
+  - Field `images` ngoài chuẩn OpenAI nên SDK thường bỏ qua an toàn.
 - **Function calling** (`tools` → `tool_calls`): **giả lập bằng prompt** — backend Gemini web không có tool API native. Sidecar nhét schema `tools` vào prompt, model xuất JSON, parse ngược thành `tool_calls` chuẩn OpenAI (`finish_reason:"tool_calls"`); hỗ trợ `tool_choice` auto/required/none/chỉ-định và round-trip `role:"tool"`. Chạy tốt với gemini-3-pro nhưng best-effort (phụ thuộc model bám format). Tắt bằng `TOOL_EMULATION=false`.
-- **Vision** (ảnh input `image_url`): **đã nối dây nhưng backend chặn** — `gemini_webapi` upload ảnh đang lỗi upstream (Google trả 1096/1100), gửi ảnh hiện trả 502. Code sẵn sàng, tự chạy khi lib vá; vision thật cần Gemini API chính thức (có API key).
 
 ### Tích hợp 9Router — 3 provider surface riêng
 

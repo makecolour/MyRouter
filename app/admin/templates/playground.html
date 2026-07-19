@@ -71,7 +71,7 @@
           <label class="form-label" for="gm-prompt">Message</label>
           <textarea id="gm-prompt" class="form-control mb-2" rows="3" placeholder="Ask something…"></textarea>
           <label class="form-label" for="gm-image">Images
-            <span class="text-secondary">(vision — hiện backend Gemini web đang trả 502, xem README)</span>
+            <span class="text-secondary">(vision — Gemini nhận ảnh input; có thể lỗi tạm thời khi bị rate-limit)</span>
           </label>
           <input id="gm-image" class="form-control mb-1" type="file" accept="image/*" multiple>
           <div id="gm-image-preview" class="mb-2"></div>
@@ -346,14 +346,23 @@
     var box = $("gm-answer-images");
     box.innerHTML = "";
     (images || []).forEach(function (im) {
-      if (!im || !im.url) return;
-      var a = document.createElement("a");
-      a.href = im.url; a.target = "_blank"; a.rel = "noopener";
-      if (im.title) a.title = im.title + (im.kind ? " (" + im.kind + ")" : "");
-      var img = document.createElement("img");
-      img.src = im.url; img.alt = im.alt || im.title || ""; img.className = "pg-image mb-2";
-      a.appendChild(img);
-      box.appendChild(a);
+      if (!im) return;
+      if (im.url) {
+        var a = document.createElement("a");
+        a.href = im.url; a.target = "_blank"; a.rel = "noopener";
+        if (im.title) a.title = im.title + (im.kind ? " (" + im.kind + ")" : "");
+        var img = document.createElement("img");
+        img.src = im.url; img.alt = im.alt || im.title || ""; img.className = "pg-image mb-2";
+        a.appendChild(img);
+        box.appendChild(a);
+      } else {
+        // Generated image Google refused to serve (403) — show a note.
+        var note = document.createElement("div");
+        note.className = "alert alert-warning py-1 px-2 mb-2";
+        note.textContent = "🖼️ " + (im.title || (im.kind || "image")) +
+          " — không tải được (" + (im.error || "unavailable") + ")";
+        box.appendChild(note);
+      }
     });
   }
 

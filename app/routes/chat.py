@@ -334,45 +334,82 @@ def _cleanup_files(paths: List[Path]) -> None:
             pass
 
 
+def _minimal_image_session(gclient):
+    """A curl_cffi session with ONLY the two core auth cookies.
+
+    The pooled client injects the full ~38-cookie jar (flattened to
+    .google.com) which Google's image CDN (lh3.googleusercontent.com) rejects
+    with 403. A minimal PSID/PSIDTS session — like the stock GeminiClient —
+    downloads generated images fine. Returns None if the cookies are missing.
+    """
+    from curl_cffi.requests import AsyncSession
+
+    jar = getattr(gclient, "cookies", None)
+    if jar is None:
+        return None
+    try:
+        psid = jar.get("__Secure-1PSID")
+        psidts = jar.get("__Secure-1PSIDTS")
+    except Exception:
+        return None
+    if not psid:
+        return None
+    session = AsyncSession(impersonate="chrome", allow_redirects=True)
+    session.cookies.set("__Secure-1PSID", psid, domain=".google.com")
+    if psidts:
+        session.cookies.set("__Secure-1PSIDTS", psidts, domain=".google.com")
+    return session
+
+
 async def _extract_gemini_images(result, gclient=None) -> List[dict]:
     """Media the Gemini reply carried: web images (public URL passthrough) and
-    generated images (auth'd Google URLs → downloaded via the live session and
-    embedded as base64 data URIs so a browser can render them).
+    generated images (Google CDN URLs → downloaded and embedded as base64 so a
+    browser can render them).
 
-    `gclient` is the pooled GeminiClient; its authenticated session is passed
-    to save() so the generated-image download doesn't 403.
+    Generated images are fetched with a minimal PSID/PSIDTS session (see
+    `_minimal_image_session`) — the pooled client's full cookie jar 403s.
     """
-    session = getattr(gclient, "client", None)
     out: List[dict] = []
-    for img in (getattr(result, "images", None) or [])[:8]:
-        entry = {
-            "title": getattr(img, "title", None),
-            "alt": getattr(img, "alt", None),
-        }
-        try:
-            if isinstance(img, GeneratedImage):
-                # full_size=False skips the RPC that 403s; the live session
-                # carries the right cookies/headers for the preview download.
-                saved = await img.save(
-                    path=tempfile.gettempdir(),
-                    client=session,
-                    full_size=False,
-                )
-                path = Path(saved)
-                data = path.read_bytes()
-                _cleanup_files([path])
-                mime = mimetypes.guess_type(saved)[0] or "image/png"
-                entry["url"] = f"data:{mime};base64," + base64.b64encode(data).decode()
-                entry["kind"] = "generated"
-            else:
-                entry["url"] = getattr(img, "url", None)
-                entry["kind"] = "web"
-        except Exception as exc:
-            logger.warning("Could not fetch a Gemini image: %s", exc)
-            continue
-        if entry.get("url"):
-            out.append(entry)
-    return out
+    dl_session = None
+    try:
+        for img in (getattr(result, "images", None) or [])[:8]:
+            is_gen = isinstance(img, GeneratedImage)
+            entry = {
+                "title": getattr(img, "title", None),
+                "alt": getattr(img, "alt", None),
+                "kind": "generated" if is_gen else "web",
+            }
+            try:
+                if is_gen:
+                    if dl_session is None:
+                        dl_session = _minimal_image_session(gclient)
+                    saved = await img.save(
+                        path=tempfile.gettempdir(),
+                        client=dl_session,
+                        full_size=False,
+                    )
+                    path = Path(saved)
+                    data = path.read_bytes()
+                    _cleanup_files([path])
+                    mime = mimetypes.guess_type(saved)[0] or "image/png"
+                    entry["url"] = (
+                        f"data:{mime};base64," + base64.b64encode(data).decode()
+                    )
+                else:
+                    entry["url"] = getattr(img, "url", None)
+            except Exception as exc:
+                logger.warning("Could not fetch a Gemini image: %s", exc)
+                entry["url"] = None
+                entry["error"] = f"download failed ({str(exc)[:60] or 'error'})"
+            if entry.get("url") or entry.get("error"):
+                out.append(entry)
+        return out
+    finally:
+        if dl_session is not None:
+            try:
+                await dl_session.close()
+            except Exception:
+                pass
 
 
 async def _gemini_chat(
