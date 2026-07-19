@@ -77,6 +77,7 @@
           <div id="gm-image-preview" class="mb-2"></div>
           <button id="gm-send" class="btn btn-primary" type="button">Send</button>
           <div id="gm-answer" class="mt-3"></div>
+          <div id="gm-answer-images" class="mt-2"></div>
           <pre id="gm-raw" class="pg-response mt-2 d-none"></pre>
         </div>
       </div>
@@ -340,6 +341,22 @@
     $("gm-image-preview").innerHTML = "";
   }
 
+  // Render images the API returned (web + generated) below the answer.
+  function gmRenderAnswerImages(images) {
+    var box = $("gm-answer-images");
+    box.innerHTML = "";
+    (images || []).forEach(function (im) {
+      if (!im || !im.url) return;
+      var a = document.createElement("a");
+      a.href = im.url; a.target = "_blank"; a.rel = "noopener";
+      if (im.title) a.title = im.title + (im.kind ? " (" + im.kind + ")" : "");
+      var img = document.createElement("img");
+      img.src = im.url; img.alt = im.alt || im.title || ""; img.className = "pg-image mb-2";
+      a.appendChild(img);
+      box.appendChild(a);
+    });
+  }
+
   async function gmSend() {
     var model = $("gm-model").value, msg = $("gm-prompt").value.trim();
     var imageParts = await readImageParts();
@@ -362,6 +379,7 @@
       if (r.resp.ok) {
         var m = r.data.choices[0].message;
         alertBox($("gm-answer"), true, m.content || JSON.stringify(m.tool_calls || m));
+        gmRenderAnswerImages(m.images);
         gmClearImages();
         if (r.data.conversation_id) {
           localStorage.setItem(convStoreKey(), r.data.conversation_id);

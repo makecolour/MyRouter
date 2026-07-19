@@ -10,6 +10,7 @@ starts a server-side thread, an existing id continues it (only the last user
 message is sent); the response carries `conversation_id` back.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -30,6 +31,7 @@ from gemini_webapi import (
     TemporarilyBlocked,
     UsageLimitExceeded,
 )
+from gemini_webapi import GeneratedImage
 from gemini_webapi import TimeoutError as GeminiTimeoutError
 from gemini_webapi.constants import DEFAULT_METADATA as GEMINI_DEFAULT_METADATA
 from notebooklm import NotebookNotFoundError
@@ -126,8 +128,8 @@ async def gemini_chat_dispatch(
     if request.stream:
         return await _gemini_stream_response(request, ctx, model, prompt)
 
-    answer, conversation_id = await _gemini_chat(request, ctx, model, prompt)
-    return _chat_response(request, model, prompt, answer, conversation_id)
+    answer, conversation_id, images = await _gemini_chat(request, ctx, model, prompt)
+    return _chat_response(request, model, prompt, answer, conversation_id, images)
 
 
 def _chat_response(
@@ -136,6 +138,7 @@ def _chat_response(
     prompt: str,
     answer: str,
     conversation_id: Optional[str] = None,
+    images: Optional[List[dict]] = None,
 ):
     """OpenAI response assembly shared by non-streaming + NotebookLM streaming."""
     if request.stream:
@@ -143,7 +146,7 @@ def _chat_response(
             sse_chunks(model, prompt, answer, conversation_id),
             media_type="text/event-stream",
         )
-    payload = build_chat_response(model, prompt, answer)
+    payload = build_chat_response(model, prompt, answer, images=images)
     if conversation_id:
         payload["conversation_id"] = conversation_id
     return payload
@@ -331,9 +334,40 @@ def _cleanup_files(paths: List[Path]) -> None:
             pass
 
 
+async def _extract_gemini_images(result) -> List[dict]:
+    """Media the Gemini reply carried: web images (public URL passthrough) and
+    generated images (auth'd Google URLs → downloaded via the session and
+    embedded as base64 data URIs so a browser can render them).
+    """
+    out: List[dict] = []
+    for img in (getattr(result, "images", None) or [])[:8]:
+        entry = {
+            "title": getattr(img, "title", None),
+            "alt": getattr(img, "alt", None),
+        }
+        try:
+            if isinstance(img, GeneratedImage):
+                saved = await img.save(path=tempfile.gettempdir())
+                path = Path(saved)
+                data = path.read_bytes()
+                _cleanup_files([path])
+                mime = mimetypes.guess_type(saved)[0] or "image/png"
+                entry["url"] = f"data:{mime};base64," + base64.b64encode(data).decode()
+                entry["kind"] = "generated"
+            else:
+                entry["url"] = getattr(img, "url", None)
+                entry["kind"] = "web"
+        except Exception as exc:
+            logger.warning("Could not fetch a Gemini image: %s", exc)
+            continue
+        if entry.get("url"):
+            out.append(entry)
+    return out
+
+
 async def _gemini_chat(
     request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], List[dict]]:
     model_kwargs = {"model": model} if model.startswith("gemini-") else {}
     conv_id_in = (request.conversation_id or "").strip() or None
     try:
@@ -359,9 +393,10 @@ async def _gemini_chat(
         finally:
             _cleanup_files(files)
         answer = extract_text(result)
+        out_images = await _extract_gemini_images(result)
         if conv_id:
             await _persist_conversation(is_new, conv_id, ctx, model, session, title)
-        return answer, conv_id
+        return answer, conv_id, out_images
     except Exception as exc:
         raise _map_gemini_exception(exc, model, ctx.profile_name)
 
@@ -489,6 +524,7 @@ async def _gemini_stream_response(
         created = int(time.time())
         accumulated = ""
         errored = False
+        last_output = None
         # Flush the role chunk right away so routers see the stream start
         # (low TTFT) instead of waiting for Gemini's first snapshot.
         yield _sse_line(
@@ -502,11 +538,21 @@ async def _gemini_stream_response(
             async for output in client.generate_content_stream(
                 send_text, files=files or None, **stream_kwargs
             ):
+                last_output = output
                 delta = _delta_text(output)
                 if delta:
                     accumulated += delta
                     yield _sse_line(
                         chunk_id, created, model, {"content": delta},
+                        conversation_id=conv_id,
+                    )
+            # Emit any images the reply carried (web + generated) once the
+            # text is done, as a delta with a non-standard `images` field.
+            if last_output is not None:
+                out_images = await _extract_gemini_images(last_output)
+                if out_images:
+                    yield _sse_line(
+                        chunk_id, created, model, {"images": out_images},
                         conversation_id=conv_id,
                     )
         except Exception as exc:

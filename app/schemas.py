@@ -193,6 +193,7 @@ def build_chat_response(
     prompt: str,
     answer: str,
     tool_calls: Optional[List[dict]] = None,
+    images: Optional[List[dict]] = None,
 ) -> dict:
     message: Dict[str, Any] = {"role": "assistant"}
     if tool_calls:
@@ -204,6 +205,11 @@ def build_chat_response(
         message["content"] = answer
         finish = "stop"
         completion_chars = len(answer)
+    # Extra media the Gemini backend returned (web + generated images). Not a
+    # standard OpenAI field — ignored by plain SDK clients, rendered by the
+    # playground.
+    if images:
+        message["images"] = images
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",

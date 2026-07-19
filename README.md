@@ -164,6 +164,7 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 ### Năng lực chat (Gemini)
 
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
+- **Ảnh trong response** (Gemini trả về): web images (URL công khai) + generated images (Gemini tạo — sidecar tải kèm cookie phiên, nhúng base64) được đưa vào `message.images` (`[{url, title, alt, kind}]`); playground render `<img>`. Field ngoài chuẩn OpenAI nên SDK thường bỏ qua an toàn.
 - **Function calling** (`tools` → `tool_calls`): **giả lập bằng prompt** — backend Gemini web không có tool API native. Sidecar nhét schema `tools` vào prompt, model xuất JSON, parse ngược thành `tool_calls` chuẩn OpenAI (`finish_reason:"tool_calls"`); hỗ trợ `tool_choice` auto/required/none/chỉ-định và round-trip `role:"tool"`. Chạy tốt với gemini-3-pro nhưng best-effort (phụ thuộc model bám format). Tắt bằng `TOOL_EMULATION=false`.
 - **Vision** (ảnh input `image_url`): **đã nối dây nhưng backend chặn** — `gemini_webapi` upload ảnh đang lỗi upstream (Google trả 1096/1100), gửi ảnh hiện trả 502. Code sẵn sàng, tự chạy khi lib vá; vision thật cần Gemini API chính thức (có API key).
 
