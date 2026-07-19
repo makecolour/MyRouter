@@ -334,11 +334,15 @@ def _cleanup_files(paths: List[Path]) -> None:
             pass
 
 
-async def _extract_gemini_images(result) -> List[dict]:
+async def _extract_gemini_images(result, gclient=None) -> List[dict]:
     """Media the Gemini reply carried: web images (public URL passthrough) and
-    generated images (auth'd Google URLs → downloaded via the session and
+    generated images (auth'd Google URLs → downloaded via the live session and
     embedded as base64 data URIs so a browser can render them).
+
+    `gclient` is the pooled GeminiClient; its authenticated session is passed
+    to save() so the generated-image download doesn't 403.
     """
+    session = getattr(gclient, "client", None)
     out: List[dict] = []
     for img in (getattr(result, "images", None) or [])[:8]:
         entry = {
@@ -347,7 +351,13 @@ async def _extract_gemini_images(result) -> List[dict]:
         }
         try:
             if isinstance(img, GeneratedImage):
-                saved = await img.save(path=tempfile.gettempdir())
+                # full_size=False skips the RPC that 403s; the live session
+                # carries the right cookies/headers for the preview download.
+                saved = await img.save(
+                    path=tempfile.gettempdir(),
+                    client=session,
+                    full_size=False,
+                )
                 path = Path(saved)
                 data = path.read_bytes()
                 _cleanup_files([path])
@@ -393,7 +403,7 @@ async def _gemini_chat(
         finally:
             _cleanup_files(files)
         answer = extract_text(result)
-        out_images = await _extract_gemini_images(result)
+        out_images = await _extract_gemini_images(result, client)
         if conv_id:
             await _persist_conversation(is_new, conv_id, ctx, model, session, title)
         return answer, conv_id, out_images
@@ -549,7 +559,7 @@ async def _gemini_stream_response(
             # Emit any images the reply carried (web + generated) once the
             # text is done, as a delta with a non-standard `images` field.
             if last_output is not None:
-                out_images = await _extract_gemini_images(last_output)
+                out_images = await _extract_gemini_images(last_output, client)
                 if out_images:
                     yield _sse_line(
                         chunk_id, created, model, {"images": out_images},
