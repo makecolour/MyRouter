@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     auto_relogin: bool = True
     auto_relogin_wait: float = 60.0  # seconds an API call waits for the login
 
+    # Emit the OpenAI "data: [DONE]" SSE terminator. Standard clients expect
+    # it; set false if a downstream router (e.g. 9Router) leaks the [DONE]
+    # sentinel into its non-stream aggregated JSON.
+    sse_include_done: bool = True
+
     log_level: str = "INFO"
 
 

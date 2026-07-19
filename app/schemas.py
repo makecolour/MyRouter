@@ -8,6 +8,8 @@ from typing import Any, Iterator, List, Optional
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
 
+from .config import settings
+
 
 def openai_error(
     status_code: int,
@@ -172,7 +174,8 @@ def sse_chunks(
     # Usage ON the finish chunk — routers that stop at finish_reason would
     # drop a trailing usage-only chunk (see chat._gemini_stream_response).
     yield chunk({}, finish_reason="stop", usage=usage)
-    yield "data: [DONE]\n\n"
+    if settings.sse_include_done:
+        yield "data: [DONE]\n\n"
 
 
 def extract_text(result: Any) -> str:

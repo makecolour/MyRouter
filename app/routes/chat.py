@@ -31,6 +31,7 @@ from gemini_webapi.constants import DEFAULT_METADATA as GEMINI_DEFAULT_METADATA
 from notebooklm import NotebookNotFoundError
 from sqlalchemy import select
 
+from ..config import settings
 from ..db import SessionLocal
 from ..models import GeminiConversation, utcnow
 from ..pool import get_gemini_client, get_notebook_client, notebook_locks
@@ -406,7 +407,8 @@ async def _gemini_stream_response(
         usage = _estimate_usage(prompt, accumulated)
         yield _sse_line(chunk_id, created, model, {}, finish_reason="stop",
                         conversation_id=conv_id, usage=usage)
-        yield "data: [DONE]\n\n"
+        if settings.sse_include_done:
+            yield "data: [DONE]\n\n"
         logger.info(
             "stream done (model=%s): %d chars, usage=%s",
             model,
