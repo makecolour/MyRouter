@@ -135,9 +135,14 @@ async def run_copilot_login(name: str) -> bool:
         session_dir(name).mkdir(parents=True, exist_ok=True)
         command = _build_login_invocation(name)
         logger.info("Starting Copilot login for '%s': %s", name, " ".join(command))
+        logger.info("Copilot login progress log: %s", session_dir(name) / "login.log")
+        # PYTHONUNBUFFERED so the vendored login's progress ("A browser window is
+        # open…", "chat token captured…") streams to the PM2 log live instead of
+        # sitting in a block-buffered pipe until the subprocess exits.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(*command, env={**os.environ})
+            proc = await asyncio.create_subprocess_exec(*command, env=env)
             returncode = await asyncio.wait_for(
                 proc.wait(), timeout=settings.copilot_login_timeout
             )
