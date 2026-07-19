@@ -176,6 +176,52 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 - Lưu ý: key trên URL của surface NotebookLM sẽ xuất hiện trong access log — chỉ dùng trong mạng tin cậy.
 - Output Format "JSON (Base64)"/"Binary File" và Size "auto" của form ảnh 9Router được hỗ trợ sẵn.
 
+### Streaming vs non-streaming
+
+Sidecar hỗ trợ **cả hai** trên mọi surface, theo chuẩn OpenAI — quyết định bằng field `stream` trong body:
+
+| `stream` | Sidecar trả về |
+|---|---|
+| `true` | SSE: chunk `role` (ra ngay, TTFT thấp) → các chunk `content` delta tăng dần (Gemini stream thật) → chunk `finish` mang `usage` → `data: [DONE]`. NotebookLM: một chunk trả lời + finish/usage. |
+| bỏ trống / `false` | Một object JSON `chat.completion` sạch (không SSE, không `[DONE]`). |
+
+Gọi **thẳng sidecar** thì cả hai chế độ đều sạch từng byte:
+
+```js
+// STREAMING — đọc SSE, bỏ qua [DONE]
+const res = await fetch(`${BASE}/v1/chat/completions`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+  body: JSON.stringify({ model: "gemini-3-pro", stream: true,
+                         messages: [{ role: "user", content: "Xin chào" }] })
+});
+const reader = res.body.getReader(); const dec = new TextDecoder();
+let full = "", buf = "";
+while (true) {
+  const { done, value } = await reader.read(); if (done) break;
+  buf += dec.decode(value, { stream: true });
+  const lines = buf.split("\n"); buf = lines.pop();
+  for (const l of lines) {
+    const t = l.trim(); if (!t.startsWith("data:")) continue;
+    const p = t.slice(5).trim(); if (p === "[DONE]") continue;
+    const d = JSON.parse(p).choices?.[0]?.delta?.content; if (d) full += d;
+  }
+}
+
+// NON-STREAM — JSON thuần
+const data = await (await fetch(`${BASE}/v1/chat/completions`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+  body: JSON.stringify({ model: "gemini-3-pro",
+                         messages: [{ role: "user", content: "Xin chào" }] })
+})).json();   // data.choices[0].message.content
+```
+
+**Qua 9Router có một lưu ý:** 9Router luôn stream tới upstream. Client **streaming** (Cursor, Claude Code, Cline, Copilot — chế độ 9Router sinh ra để phục vụ) chạy tốt vì 9Router forward thẳng SSE. Nhưng khi client gọi **non-stream** (`response.json()`), 9Router gom SSE lại thành JSON rồi **ghép nhầm `data: [DONE]` vào sau** → `response.json()` lỗi *"Unexpected non-whitespace character after JSON"*. Đây là **bug của 9Router** (content + usage đã gom đúng, chỉ dư terminator), sidecar không can thiệp được. Cách xử lý:
+- Ưu tiên **dùng streaming** qua 9Router (đúng thiết kế), hoặc
+- **Trỏ client thẳng vào sidecar** cho các provider này (mất fallback/RTK của 9Router nhưng cả hai chế độ sạch), hoặc
+- Parse phòng thủ ở client: `JSON.parse(text.split('data: [DONE]')[0].trim())`.
+
 ---
 
 ## 5. Vận hành & xử lý sự cố
@@ -187,6 +233,7 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 | 403 `wrong_key_type` | Dùng nhầm loại key (google ↔ comfy). |
 | Chat Gemini không hiện trong lịch sử web | Đã fix (cache cookie degraded); nếu tái diễn: Re-login profile, kiểm tra log có `UNAUTHENTICATED`. |
 | `model_not_found` khi gọi Gemini | Xem model hợp lệ qua `GET /v1/models`. |
+| 9Router trả JSON dính `data: [DONE]` (non-stream) | Bug aggregate của 9Router — xem mục "Streaming vs non-streaming". Dùng streaming, hoặc trỏ thẳng sidecar, hoặc parse phòng thủ. |
 | ComfyUI 502/504 | Tunnel down hoặc checkpoint không tồn tại — kiểm tra `GET /v1/comfy/info`, `/v1/comfy/queue`. |
 | Theo dõi | Bảng **Request Logs** trên dashboard (endpoint, status, latency, error); trang **Status** có thống kê 24h + reachability. |
 
