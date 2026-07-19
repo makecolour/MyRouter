@@ -127,6 +127,10 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Copilot per-account sessions (cookies + MSAL token + browser profile) — secret
+copilot_sessions/
+session/
+
 # Environments
 .env
 .venv

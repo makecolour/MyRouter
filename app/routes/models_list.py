@@ -157,6 +157,10 @@ async def list_models(ctx: AuthContext = Depends(get_auth)):
 async def _handle(ctx: AuthContext) -> dict:
     if ctx.kind == "comfy":
         return {"object": "list", "data": await comfy_model_entries(ctx)}
+    if ctx.kind == "copilot":
+        from .copilot_api import copilot_model_entries
+
+        return {"object": "list", "data": copilot_model_entries()}
 
     data = await gemini_model_entries(ctx)
     try:

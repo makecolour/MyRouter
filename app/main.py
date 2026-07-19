@@ -30,6 +30,7 @@ from .admin.views import (
     ApiKeyAdmin,
     ApiPlaygroundView,
     ComfyInstanceAdmin,
+    CopilotProfileAdmin,
     GoogleProfileAdmin,
     RequestLogAdmin,
     StatusView,
@@ -38,9 +39,11 @@ from .config import settings
 from .db import engine, ensure_schema
 from .google_auth import startup_auto_import, sync_profile_to_db
 from .pool import close_all, pooled_profiles
+from . import copilot_pool
 from .routes import (
     chat,
     comfy_api,
+    copilot_api,
     gemini_api,
     images,
     models_list,
@@ -106,6 +109,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception:
             logger.warning("Shutdown cookie sync failed for '%s'", profile)
     await close_all()
+    await copilot_pool.close_all()
     await comfy.close_http()
     await engine.dispose()
     logger.info("AI Sidecar shut down cleanly")
@@ -137,6 +141,7 @@ app.include_router(notebooklm.router)
 app.include_router(gemini_api.router)
 app.include_router(notebooklm_api.router)
 app.include_router(comfy_api.router)
+app.include_router(copilot_api.router)
 
 
 @app.get("/healthz")
@@ -155,5 +160,6 @@ admin.add_view(StatusView)
 admin.add_view(ApiPlaygroundView)
 admin.add_view(ApiKeyAdmin)
 admin.add_view(GoogleProfileAdmin)
+admin.add_view(CopilotProfileAdmin)
 admin.add_view(ComfyInstanceAdmin)
 admin.add_view(RequestLogAdmin)

@@ -1,12 +1,13 @@
 # MyRouter — AI Sidecar
 
-Sidecar **tương thích OpenAI API** cho [9Router], làm cầu nối tới ba backend:
+Sidecar **tương thích OpenAI API** cho [9Router], làm cầu nối tới bốn backend:
 
 | Backend | Thư viện / Giao thức | Model string |
 |---|---|---|
 | **Google Gemini** (web app, tài khoản Google Pro) | `gemini_webapi` | `gemini`, `gemini-3-flash`, `gemini-3-pro`, `gemini-3-flash-thinking` |
 | **NotebookLM** | `notebooklm-py` | `<notebook_id>` (raw UUID của notebook) |
 | **ComfyUI** (nhiều instance, tunnel, không auth) | HTTP API | tên instance trong bảng `comfy_instances` (vd `comfy1`) |
+| **Microsoft Copilot** (nhiều tài khoản MS) | `Windows-Copilot-API` (vendored, `third_party/`) | `copilot` (một model duy nhất) |
 
 Điểm đặc biệt: **MySQL là nguồn chân lý cho Google auth** — đăng nhập một lần, cookie được lưu vào DB, tự materialize ra file khi cần, tự đồng bộ khi Google xoay cookie, và **tự re-login** khi hết hạn (thường im lặng trong ~5 giây nhờ phiên browser persistent).
 
@@ -19,26 +20,32 @@ app/
 ├── main.py            # FastAPI app, lifespan (migration, sync task), mount admin
 ├── config.py          # Settings (pydantic-settings, đọc .env)
 ├── db.py              # SQLAlchemy async engine + ensure_schema() (tự migrate)
-├── models.py          # ApiKey, GoogleProfile, ComfyInstance, GeminiConversation, RequestLog
-├── security.py        # Bearer auth 2 loại key + request logging
+├── models.py          # ApiKey, Google/CopilotProfile, ComfyInstance, Gemini/CopilotConversation, RequestLog
+├── security.py        # Bearer auth 3 loại key (google/comfy/copilot) + request logging
 ├── google_auth.py     # Cầu nối DB↔storage_state, login subprocess, auto re-login
+├── copilot_lib.py     # Bọc thư viện vendored: SessionCopilotClient (session_dir mỗi account)
+├── copilot_auth.py    # Session dir + status + login subprocess (scripts/copilot_login.py)
+├── copilot_pool.py    # Pool client Copilot, khóa serialize mỗi account, to_thread
 ├── pool.py            # Pool client NotebookLM/Gemini theo profile (lazy, retry khi expired)
 ├── comfy.py           # Workflow builder, info/queue, tải ảnh, upload/analyze input, ephemeral
 ├── comfy_provision.py # ComfyUI-Manager V3.41: dò node/model thiếu, cài, poll status
 ├── routes/
 │   ├── chat.py        # /v1/chat/completions + /v1/conversations
 │   ├── images.py      # /v1/images/generations + /v1/comfy/*
+│   ├── copilot_api.py # /copilot/v1/* (models, chat, conversations)
 │   ├── models_list.py # /v1/models
 │   └── notebooklm.py  # /v1/notebooklm/* (generate, artifacts, status, download)
+├── third_party/windows_copilot_api/  # thư viện Copilot vendored (MIT, không sửa)
 └── admin/             # Dashboard SQLAdmin (/admin) + API Playground
 ```
 
-### Hai loại API key (bảng `api_keys`)
+### Ba loại API key (bảng `api_keys`)
 
 | `key_type` | Gắn với | Dùng được |
 |---|---|---|
 | `google` | một Google profile (`profile_name`) | Gemini **và** NotebookLM (chung cookie) |
 | `comfy` | đúng một ComfyUI instance (`comfy_instance`) | các endpoint ảnh của instance đó |
+| `copilot` | một Copilot profile (`copilot_profile`) | `/copilot/v1/*` của account đó |
 
 Dùng chéo bị chặn 403. `/v1/models` trả danh sách theo loại key.
 
@@ -198,6 +205,29 @@ POST /v1/comfy/upload
 - `ref` = tên file (bare) khi vào `input/`, hoặc `"tên [temp]"` khi ephemeral (ComfyUI hiểu annotation `[temp]`/`[output]`).
 - **Ephemeral upload = thư mục temp** (tự dọn, không vào `input/` cố định). ComfyUI **không có API xóa file input** ngay lập tức, nên temp là cơ chế "không lưu" khả dụng (giống ephemeral output).
 
+**Microsoft Copilot** (copilot key; nhiều tài khoản MS — mỗi key gắn 1 account):
+
+```jsonc
+POST /copilot/v1/chat/completions
+{ "model": "copilot",
+  "stream": false,                      // true = SSE token-by-token
+  "conversation_id": "new",             // "new" tạo mới; id cũ để chat tiếp; bỏ trống = stateless
+  "messages": [
+    { "role": "user", "content": [      // 1 ảnh input (Copilot đọc được)
+        { "type": "text", "text": "Ảnh này là gì?" },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,…" } } ] } ],
+  "tools": [ /* … */ ]                   // function calling: GIẢ LẬP như Gemini (TOOL_EMULATION)
+}
+GET /copilot/v1/models                   # luôn trả 1 model "copilot"
+GET /copilot/v1/conversations            # lịch sử thread (sidecar tự lưu)
+DELETE /copilot/v1/conversations/{id}
+```
+
+- **Năng lực** (đúng những gì thư viện hỗ trợ): text, **streaming**, **conversation**, **1 ảnh input**, **ảnh output** (`message.images`), **function calling giả lập** (`app/tools.py`, như Gemini). Không có: chọn model/mode (mode cố định `"smart"`), upload file khác ảnh, web-search/plugin.
+- **Đăng nhập**: dashboard **Status → Copilot Profiles → Add account & login** → cửa sổ browser Microsoft/Google mở trên máy chủ (**cần màn hình**). Session lưu ở `COPILOT_SESSION_ROOT/<name>/` (git-ignored), DB chỉ giữ trạng thái.
+- **Cloudflare clearance (~30 phút)**: chỉ lấy được bằng **browser thật**. Trên máy **có màn hình** (PM2 desktop) mọi thứ tự chạy. Trên **VPS headless**, khi clearance hết hạn API trả `503 clearance_required` → phải login lại trên máy có màn hình (chia sẻ session dir). Client pool chạy `interactive_clear=False` để fail-fast 503 thay vì treo server mở browser.
+- **Serialize**: một account xử lý tuần tự (~1–4 request đồng thời); MyRouter khóa `asyncio.Lock` mỗi account. Đây là cầu nối cá nhân, không phải gateway throughput cao.
+
 ### Năng lực chat (Gemini)
 
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
@@ -215,9 +245,10 @@ POST /v1/comfy/upload
 | Gemini | `http://<host>:<port>/gemini/v1` | google key qua header | `gemini`, `gemini-3-*` |
 | NotebookLM | `http://<host>:<port>/notebooklm/<api-key>/v1` | **key nằm trong URL** — không cần header | toàn bộ notebook id + tiêu đề của profile |
 | ComfyUI (mỗi instance) | `http://<host>:<port>/comfyui/v1` | comfy key qua header | đúng instance của key |
+| Copilot (mỗi account) | `http://<host>:<port>/copilot/v1` | copilot key qua header | `copilot` |
 
 - Mỗi surface chỉ phục vụ backend của nó: gửi notebook id vào `/gemini/v1` (hoặc `gemini` vào `/notebooklm/...`) → 404 kèm chỉ dẫn sang surface đúng.
-- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue` + `/comfy/provision` (+ `/status`) + `/comfy/analyze` + `/comfy/upload`; lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
+- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue` + `/comfy/provision` (+ `/status`) + `/comfy/analyze` + `/comfy/upload`; `/copilot/v1` có cả `/conversations`; lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
 - Bề mặt gộp cũ `/v1/*` giữ nguyên (playground, OpenAI SDK, provider cũ).
 - 9Router chạy trong Docker: dùng `http://172.17.0.1:<port>` (bridge IP) thay vì `localhost`.
 - Lưu ý: key trên URL của surface NotebookLM sẽ xuất hiện trong access log — chỉ dùng trong mạng tin cậy.
@@ -311,11 +342,13 @@ console.log("STREAMING:", out);
 |---|---|
 | 502 `profile_auth_expired` | Auth hết hạn và auto re-login chưa xong — nếu có cửa sổ browser đang mở trên máy chủ, đăng nhập nốt rồi gọi lại; hoặc vào Status bấm Re-login. Cooldown 2 phút giữa các lần tự thử. |
 | Cửa sổ Edge tự bật khi gọi API | Là auto re-login (thường tự đóng ~5s). Tắt bằng `AUTO_RELOGIN=false`. |
-| 403 `wrong_key_type` | Dùng nhầm loại key (google ↔ comfy). |
+| 403 `wrong_key_type` | Dùng nhầm loại key (google ↔ comfy ↔ copilot). |
+| Copilot `503 clearance_required` | Cloudflare clearance hết hạn, không tự làm mới headless được — vào Status → Copilot Profiles → Re-login trên máy **có màn hình** (chia sẻ session dir). Xem mục Copilot. |
+| Copilot `502 profile_auth_expired` / `503 profile_not_authenticated` | Account chưa login hoặc session hết hạn — login lại ở Status. |
 | Chat Gemini không hiện trong lịch sử web | Đã fix (cache cookie degraded); nếu tái diễn: Re-login profile, kiểm tra log có `UNAUTHENTICATED`. |
 | `model_not_found` khi gọi Gemini | Xem model hợp lệ qua `GET /v1/models`. |
 | 9Router trả JSON dính `data: [DONE]` (non-stream) | Bug aggregate của 9Router — xem mục "Streaming vs non-streaming". Dùng streaming, hoặc trỏ thẳng sidecar, hoặc parse phòng thủ. |
 | ComfyUI 502/504 | Tunnel down hoặc checkpoint không tồn tại — kiểm tra `GET /v1/comfy/info`, `/v1/comfy/queue`. |
 | Theo dõi | Bảng **Request Logs** trên dashboard (endpoint, status, latency, error); trang **Status** có thống kê 24h + reachability. |
 
-**Bảo mật**: DB chứa API key và cookie Google (bảng `google_profiles.storage_state`) — chỉ chạy trên máy tin cậy, đặt mật khẩu MySQL/admin thật, không expose `/admin` ra ngoài mạng nội bộ.
+**Bảo mật**: DB chứa API key và cookie Google (bảng `google_profiles.storage_state`); session Copilot (cookie + MSAL token + browser profile) nằm ở `COPILOT_SESSION_ROOT/` trên đĩa (đã git-ignore). Chỉ chạy trên máy tin cậy, đặt mật khẩu MySQL/admin thật, không expose `/admin` ra ngoài mạng nội bộ.

@@ -28,9 +28,10 @@ _log_tasks: set = set()
 @dataclass
 class AuthContext:
     api_key: str
-    kind: str  # "google" | "comfy"
+    kind: str  # "google" | "comfy" | "copilot"
     profile_name: Optional[str] = None
     comfy_instance: Optional[str] = None
+    copilot_profile: Optional[str] = None
 
 
 # HTTPBearer (instead of a raw Header param) gives Swagger UI an Authorize
@@ -55,6 +56,7 @@ async def lookup_api_key(token: str) -> Optional[AuthContext]:
         kind=row.key_type or "google",
         profile_name=row.profile_name,
         comfy_instance=row.comfy_instance,
+        copilot_profile=row.copilot_profile,
     )
 
 
@@ -129,6 +131,20 @@ async def require_comfy_auth(
     return ctx
 
 
+async def require_copilot_auth(
+    ctx: AuthContext = Depends(get_auth),
+) -> AuthContext:
+    """/copilot/v1 endpoints need a Copilot-profile key."""
+    if ctx.kind != "copilot" or not ctx.copilot_profile:
+        raise openai_error(
+            403,
+            "The Copilot surface requires a Copilot-profile API key "
+            "(create one in the /admin dashboard with key type 'copilot').",
+            code="wrong_key_type",
+        )
+    return ctx
+
+
 def describe_error(exc: Exception) -> str:
     """Human-readable error text for logs — never empty."""
     detail = getattr(exc, "detail", None)
@@ -150,6 +166,8 @@ def log_request(
         profile = None
     elif ctx.kind == "comfy":
         profile = f"comfy:{ctx.comfy_instance}"
+    elif ctx.kind == "copilot":
+        profile = f"copilot:{ctx.copilot_profile}"
     else:
         profile = ctx.profile_name
 

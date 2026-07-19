@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # sentinel into its non-stream aggregated JSON.
     sse_include_done: bool = True
 
+    # Microsoft Copilot (/copilot/v1), one session dir per account under this root.
+    copilot_session_root: str = "copilot_sessions"
+    # Base interactive-login command; empty -> "<python> scripts/copilot_login.py".
+    # The account's session dir is always appended as the final argument.
+    copilot_login_command: str = ""
+    copilot_login_timeout: float = 600.0
+    # Try a HEADLESS Cloudflare-clearance refresh on expiry before giving up.
+    # Default off: headless Turnstile solving is unreliable and can hang a
+    # request; off -> stale clearance fails fast with 503 clearance_required
+    # (re-clear via the dashboard/CLI login on a machine with a display).
+    copilot_headless_clear: bool = False
+
     # Vision: max size (MB) per input image; larger -> 400.
     vision_max_image_mb: float = 20.0
     # Function calling for Gemini is prompt-EMULATED (the web backend has no

@@ -250,6 +250,36 @@
         </div>
       </div>
     </div>
+
+    <!-- ============ COPILOT ============ -->
+    <div class="col-lg-6">
+      <div id="panel-copilot" class="card mb-3 pg-disabled">
+        <div class="card-header">
+          <h3 class="card-title">Copilot <span id="cp-profile" class="text-secondary"></span></h3>
+        </div>
+        <div class="card-body">
+          <label class="form-label" for="cp-conv">Conversation
+            <span class="text-secondary">(sidecar history)</span>
+          </label>
+          <div class="input-group mb-1">
+            <select id="cp-conv" class="form-select"></select>
+            <button id="cp-conv-reset" class="btn btn-outline-secondary" type="button">New</button>
+            <button id="cp-conv-del" class="btn btn-outline-danger" type="button">Delete</button>
+          </div>
+          <div id="cp-conv-status" class="text-secondary mb-2"></div>
+          <label class="form-label" for="cp-prompt">Message</label>
+          <textarea id="cp-prompt" class="form-control mb-2" rows="3" placeholder="Ask Copilot…"></textarea>
+          <label class="form-label" for="cp-image">Image
+            <span class="text-secondary">(one image; Copilot reads it)</span>
+          </label>
+          <input id="cp-image" class="form-control mb-2" type="file" accept="image/*">
+          <button id="cp-send" class="btn btn-primary" type="button">Send</button>
+          <div id="cp-answer" class="mt-3"></div>
+          <div id="cp-answer-images" class="mt-2"></div>
+          <pre id="cp-raw" class="pg-response mt-2 d-none"></pre>
+        </div>
+      </div>
+    </div>
   </div>
 
 </div>
@@ -303,8 +333,9 @@
     setPanel("panel-gemini", k === "google");
     setPanel("panel-nblm", k === "google");
     setPanel("panel-comfy", k === "comfy");
+    setPanel("panel-copilot", k === "copilot");
     $("gm-model").innerHTML = ""; $("nb-notebook").innerHTML = "";
-    $("cf-instance").textContent = "";
+    $("cf-instance").textContent = ""; $("cp-profile").textContent = "";
     if (!keySel.value) { statusEl.textContent = ""; return; }
     statusEl.textContent = "Loading models…";
     try {
@@ -322,11 +353,14 @@
           nb.appendChild(opt);
         } else if (m.owned_by === "comfyui") {
           $("cf-instance").textContent = "— " + m.id;
+        } else if (m.owned_by === "microsoft") {
+          $("cp-profile").textContent = "— " + m.id;
         }
       });
       statusEl.textContent = "Loaded " + r.data.data.length + " models.";
       if (k === "comfy") loadComfyInfo();
       if (k === "google") loadConversations();
+      if (k === "copilot") loadCopilotConversations();
     } catch (e) { statusEl.textContent = "Failed: " + e; }
   }
 
@@ -463,6 +497,104 @@
     if (r.resp.ok) {
       localStorage.removeItem(convStoreKey());
       await loadConversations("");
+    }
+  }
+
+  // ---------- Copilot ----------
+  function cpConvStoreKey() { return "pgcpconv:" + keySel.value; }
+  function cpUpdateConvStatus() {
+    var v = $("cp-conv").value;
+    $("cp-conv-status").textContent = v
+      ? "Will continue " + v : "Will start a NEW conversation";
+  }
+  async function loadCopilotConversations(selectId) {
+    var sel = $("cp-conv");
+    sel.innerHTML = "";
+    addOption(sel, null, "", "— New conversation —");
+    if (keySel.value) {
+      try {
+        var r = await api("/copilot/v1/conversations");
+        if (r.resp.ok) {
+          r.data.data.forEach(function (c) {
+            addOption(sel, null, c.id, (c.title || c.id).slice(0, 40));
+          });
+        }
+      } catch (e) { /* ignore */ }
+    }
+    var saved = selectId !== undefined ? selectId
+      : (localStorage.getItem(cpConvStoreKey()) || "");
+    sel.value = saved;
+    if (sel.value !== saved) sel.value = "";
+    cpUpdateConvStatus();
+  }
+  function cpReadImage() {
+    var f = ($("cp-image").files || [])[0];
+    if (!f) return Promise.resolve(null);
+    return new Promise(function (resolve, reject) {
+      var rd = new FileReader();
+      rd.onload = function () {
+        resolve({ type: "image_url", image_url: { url: rd.result } });
+      };
+      rd.onerror = reject;
+      rd.readAsDataURL(f);
+    });
+  }
+  function cpRenderImages(images) {
+    var box = $("cp-answer-images");
+    box.innerHTML = "";
+    (images || []).forEach(function (im) {
+      if (!im || !im.url) return;
+      var a = document.createElement("a");
+      a.href = im.url; a.target = "_blank"; a.rel = "noopener";
+      if (im.title) a.title = im.title;
+      var img = document.createElement("img");
+      img.src = im.url; img.alt = im.title || ""; img.className = "pg-image mb-2";
+      a.appendChild(img);
+      box.appendChild(a);
+    });
+  }
+  async function cpSend() {
+    var msg = $("cp-prompt").value.trim();
+    var imagePart = await cpReadImage();
+    if (!msg && !imagePart) return;
+    var priorConv = $("cp-conv").value;
+    $("cp-send").disabled = true;
+    $("cp-answer").textContent = "Waiting…";
+    try {
+      var content = imagePart ? [{ type: "text", text: msg }, imagePart] : msg;
+      var body = {
+        model: "copilot",
+        messages: [{ role: "user", content: content }],
+        conversation_id: priorConv || "new"
+      };
+      var r = await api("/copilot/v1/chat/completions",
+        { method: "POST", body: JSON.stringify(body) });
+      showRaw($("cp-raw"), r.data);
+      if (r.resp.ok) {
+        var m = r.data.choices[0].message;
+        alertBox($("cp-answer"), true, m.content || JSON.stringify(m.tool_calls || m));
+        cpRenderImages(m.images);
+        $("cp-image").value = "";
+        if (r.data.conversation_id) {
+          localStorage.setItem(cpConvStoreKey(), r.data.conversation_id);
+          await loadCopilotConversations(r.data.conversation_id);
+          $("cp-conv-status").textContent = priorConv
+            ? "Continued " + r.data.conversation_id
+            : "Started NEW conversation " + r.data.conversation_id;
+        }
+      } else {
+        alertBox($("cp-answer"), false, errText(r.resp.status, r.data));
+      }
+    } catch (e) { alertBox($("cp-answer"), false, "Request failed: " + e); }
+    $("cp-send").disabled = false;
+  }
+  async function cpDeleteConv() {
+    var conv = $("cp-conv").value;
+    if (!conv) return;
+    var r = await api("/copilot/v1/conversations/" + conv, { method: "DELETE" });
+    if (r.resp.ok) {
+      localStorage.removeItem(cpConvStoreKey());
+      await loadCopilotConversations("");
     }
   }
 
@@ -877,6 +1009,19 @@
   $("cf-send").addEventListener("click", cfSend);
   $("cf-provision").addEventListener("click", cfProvision);
   $("cf-analyze").addEventListener("click", cfAnalyze);
+  $("cp-send").addEventListener("click", cpSend);
+  $("cp-conv").addEventListener("change", function () {
+    var v = $("cp-conv").value;
+    if (v) localStorage.setItem(cpConvStoreKey(), v);
+    else localStorage.removeItem(cpConvStoreKey());
+    cpUpdateConvStatus();
+  });
+  $("cp-conv-reset").addEventListener("click", function () {
+    $("cp-conv").value = "";
+    localStorage.removeItem(cpConvStoreKey());
+    cpUpdateConvStatus();
+  });
+  $("cp-conv-del").addEventListener("click", cpDeleteConv);
   $("cf-ephemeral").addEventListener("change", function () {
     $("cf-upload-ephemeral").checked = $("cf-ephemeral").checked;
   });

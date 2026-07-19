@@ -15,12 +15,14 @@ def utcnow() -> datetime:
 
 
 class ApiKey(Base):
-    """Bearer keys, two kinds:
+    """Bearer keys, three kinds:
 
-    * key_type="google" — bound to a Google profile; valid for Gemini AND
+    * key_type="google"  — bound to a Google profile; valid for Gemini AND
       NotebookLM (they share the profile's cookies).
-    * key_type="comfy"  — bound to exactly one ComfyUI instance; the only
+    * key_type="comfy"   — bound to exactly one ComfyUI instance; the only
       kind accepted by the image endpoints.
+    * key_type="copilot" — bound to one Copilot profile (Microsoft account);
+      the only kind accepted by /copilot/v1.
     """
 
     __tablename__ = "api_keys"
@@ -29,6 +31,7 @@ class ApiKey(Base):
     key_type: Mapped[str] = mapped_column(String(16), nullable=False, default="google")
     profile_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     comfy_instance: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    copilot_profile: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[Optional[datetime]] = mapped_column(
@@ -38,11 +41,12 @@ class ApiKey(Base):
     request_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     def __str__(self) -> str:
-        target = (
-            f"comfy:{self.comfy_instance}"
-            if self.key_type == "comfy"
-            else self.profile_name
-        )
+        if self.key_type == "comfy":
+            target = f"comfy:{self.comfy_instance}"
+        elif self.key_type == "copilot":
+            target = f"copilot:{self.copilot_profile}"
+        else:
+            target = self.profile_name
         return f"{self.label or self.key_string[:14] + '…'} → {target}"
 
 
@@ -87,6 +91,40 @@ class GeminiConversation(Base):
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # "metadata" is reserved on Declarative classes, hence the attribute name.
     chat_metadata: Mapped[Any] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, default=utcnow
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, default=utcnow
+    )
+
+
+class CopilotProfile(Base):
+    """One Microsoft Copilot account. Session bytes (Playwright profile +
+    token.json) live on the filesystem under settings.copilot_session_root/<name>;
+    the DB holds only status/metadata."""
+
+    __tablename__ = "copilot_profiles"
+
+    name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    # active | expired | pending_login | error
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_login")
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.status})"
+
+
+class CopilotConversation(Base):
+    """Server-side Copilot chat threads. `id` is the library's own upstream
+    conversation_id (pass it back to continue the thread)."""
+
+    __tablename__ = "copilot_conversations"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    profile_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, default=utcnow
     )

@@ -15,6 +15,7 @@ from starlette.responses import RedirectResponse
 from wtforms import Form, SelectField, StringField
 from wtforms.validators import Optional as OptionalValidator
 
+from .. import copilot_auth, copilot_pool
 from ..comfy import probe_instance
 from ..db import SessionLocal
 from ..google_auth import (
@@ -22,7 +23,14 @@ from ..google_auth import (
     run_interactive_login,
     sync_profile_to_db,
 )
-from ..models import ApiKey, ComfyInstance, GoogleProfile, RequestLog, utcnow
+from ..models import (
+    ApiKey,
+    ComfyInstance,
+    CopilotProfile,
+    GoogleProfile,
+    RequestLog,
+    utcnow,
+)
 from ..pool import invalidate_profile, pooled_profiles
 
 logger = logging.getLogger("ai-sidecar.admin")
@@ -33,6 +41,7 @@ _bg_tasks: set = set()
 # Outcome of the most recent dashboard-triggered login per profile, shown as
 # a success/failure alert on the Status page for a few minutes.
 last_login_results: Dict[str, Tuple[bool, datetime]] = {}
+copilot_login_results: Dict[str, Tuple[bool, datetime]] = {}
 
 
 def _spawn(coro) -> None:
@@ -63,6 +72,17 @@ async def _login_and_reload(profile: str, fresh: bool = False) -> None:
         logger.exception("Background login for '%s' failed", profile)
 
 
+async def _copilot_login_and_reload(profile: str) -> None:
+    try:
+        ok = await copilot_auth.run_copilot_login(profile)
+        copilot_login_results[profile] = (ok, utcnow())
+        if ok:
+            copilot_pool.invalidate_profile(profile)
+    except Exception:
+        copilot_login_results[profile] = (False, utcnow())
+        logger.exception("Background Copilot login for '%s' failed", profile)
+
+
 _KEY_ALPHABET = string.ascii_letters + string.digits
 
 
@@ -81,6 +101,7 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
         ApiKey.key_type,
         ApiKey.profile_name,
         ApiKey.comfy_instance,
+        ApiKey.copilot_profile,
         ApiKey.enabled,
         ApiKey.request_count,
         ApiKey.last_used_at,
@@ -92,6 +113,7 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
         ApiKey.key_type,
         ApiKey.profile_name,
         ApiKey.comfy_instance,
+        ApiKey.copilot_profile,
         ApiKey.enabled,
     ]
     # SQLAdmin strips PK columns from forms by default — this makes
@@ -128,6 +150,15 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
                 .scalars()
                 .all()
             )
+            copilot_names = (
+                (
+                    await session.execute(
+                        select(CopilotProfile.name).order_by(CopilotProfile.name)
+                    )
+                )
+                .scalars()
+                .all()
+            )
         # Optional on purpose: blank -> an OpenAI-style key is auto-generated
         # in on_model_change (the scaffolded PK field would be required).
         form_class.key_string = StringField(
@@ -139,6 +170,7 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
             choices=[
                 ("google", "google — Gemini + NotebookLM (profile-bound)"),
                 ("comfy", "comfy — one ComfyUI instance"),
+                ("copilot", "copilot — one Microsoft Copilot account"),
             ],
         )
         form_class.profile_name = SelectField(
@@ -148,6 +180,10 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
         form_class.comfy_instance = SelectField(
             "ComfyUI Instance (comfy keys)",
             choices=[("", "—")] + [(name, name) for name in instance_names],
+        )
+        form_class.copilot_profile = SelectField(
+            "Copilot Profile (copilot keys)",
+            choices=[("", "—")] + [(name, name) for name in copilot_names],
         )
         return form_class
 
@@ -165,10 +201,17 @@ class ApiKeyAdmin(ModelView, model=ApiKey):
             data["profile_name"] = None
         if data.get("comfy_instance") == "":
             data["comfy_instance"] = None
+        if data.get("copilot_profile") == "":
+            data["copilot_profile"] = None
         if key_type == "google":
             data["comfy_instance"] = None
+            data["copilot_profile"] = None
         elif key_type == "comfy":
             data["profile_name"] = None
+            data["copilot_profile"] = None
+        elif key_type == "copilot":
+            data["profile_name"] = None
+            data["comfy_instance"] = None
 
 
 class GoogleProfileAdmin(ModelView, model=GoogleProfile):
@@ -187,6 +230,20 @@ class GoogleProfileAdmin(ModelView, model=GoogleProfile):
         GoogleProfile.state_sha256,
     ]
     form_columns = [GoogleProfile.status]
+    can_create = False  # profiles are created by the login flow on the Status page
+
+
+class CopilotProfileAdmin(ModelView, model=CopilotProfile):
+    name = "Copilot Profile"
+    name_plural = "Copilot Profiles"
+    icon = "fa-brands fa-microsoft"
+    column_list = [
+        CopilotProfile.name,
+        CopilotProfile.status,
+        CopilotProfile.last_login_at,
+        CopilotProfile.last_used_at,
+    ]
+    form_columns = [CopilotProfile.status]
     can_create = False  # profiles are created by the login flow on the Status page
 
 
@@ -246,6 +303,15 @@ class StatusView(BaseView):
                 .scalars()
                 .all()
             )
+            copilot_profiles = (
+                (
+                    await session.execute(
+                        select(CopilotProfile).order_by(CopilotProfile.name)
+                    )
+                )
+                .scalars()
+                .all()
+            )
             since = utcnow() - timedelta(hours=24)
             stats = (
                 await session.execute(
@@ -279,6 +345,7 @@ class StatusView(BaseView):
             *(probe_instance(i.base_url) for i in instances)
         )
         pooled = set(pooled_profiles())
+        copilot_pooled = set(copilot_pool.pooled_profiles())
 
         now = utcnow()
         context = {
@@ -307,6 +374,23 @@ class StatusView(BaseView):
                 }
                 for i, ok in zip(instances, reachability)
             ],
+            "copilot_profiles": [
+                {
+                    "name": p.name,
+                    "status": p.status,
+                    "pooled": p.name in copilot_pooled,
+                    "logging_in": copilot_auth.login_in_progress(p.name),
+                    "last_login_at": _fmt_local(p.last_login_at),
+                    "last_used_at": _fmt_local(p.last_used_at),
+                }
+                for p in copilot_profiles
+            ],
+            "copilot_login_results": [
+                {"profile": name, "ok": ok, "at": _fmt_local(at)}
+                for name, (ok, at) in copilot_login_results.items()
+                if now - at < timedelta(minutes=10)
+            ],
+            "copilot_login_running": copilot_auth.login_in_progress(),
             "stats": [
                 {
                     "model": model or "(none)",
@@ -349,6 +433,24 @@ class StatusView(BaseView):
             await invalidate_profile(profile)
         return RedirectResponse(url="/admin/status", status_code=303)
 
+    @expose("/status/copilot-login", methods=["POST"])
+    async def action_copilot_login(self, request: Request):
+        """Create-or-refresh a Copilot account by name (opens a browser)."""
+        form = await request.form()
+        profile = str(form.get("profile", "")).strip()
+        if profile and not copilot_auth.login_in_progress():
+            _spawn(_copilot_login_and_reload(profile))
+            logger.info("Dashboard triggered Copilot login for '%s'", profile)
+        return RedirectResponse(url="/admin/status", status_code=303)
+
+    @expose("/status/copilot-reload", methods=["POST"])
+    async def action_copilot_reload(self, request: Request):
+        form = await request.form()
+        profile = str(form.get("profile", "")).strip()
+        if profile:
+            copilot_pool.invalidate_profile(profile)
+        return RedirectResponse(url="/admin/status", status_code=303)
+
     @expose("/status/sync", methods=["POST"])
     async def action_sync(self, request: Request):
         for profile in pooled_profiles():
@@ -389,6 +491,8 @@ class ApiPlaygroundView(BaseView):
                     "target": (
                         f"comfy:{k.comfy_instance}"
                         if (k.key_type or "google") == "comfy"
+                        else f"copilot:{k.copilot_profile}"
+                        if (k.key_type or "google") == "copilot"
                         else (k.profile_name or "?")
                     ),
                 }

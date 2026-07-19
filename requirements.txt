@@ -13,4 +13,9 @@ itsdangerous>=2.1
 notebooklm-py
 gemini-webapi
 # used by the gemini cookie warmup utility (login browsers come from notebooklm-py)
+# and by the vendored Copilot bridge (third_party/windows_copilot_api). Run
+# `playwright install chromium` once after installing.
 playwright>=1.40
+# vendored Windows-Copilot-API driver speaks the Copilot chat protocol over a
+# Cloudflare-impersonating curl_cffi session (also used by gemini-webapi).
+curl_cffi>=0.15
