@@ -304,6 +304,34 @@ def annotated_ref(result: dict) -> str:
     return path if image_type == "input" else f"{path} [{image_type}]"
 
 
+API_FORMAT_HINT = (
+    "This looks like a ComfyUI UI export (it has 'nodes'/'links'). The API "
+    'needs the API-format graph ({"<id>": {"class_type", "inputs"}}). In '
+    "ComfyUI: open Settings, enable 'Dev mode', then use 'Save (API Format)' "
+    "and paste that JSON."
+)
+
+
+def is_ui_workflow(workflow: Any) -> bool:
+    """True for a ComfyUI UI/full-graph export (top-level 'nodes' list)."""
+    return isinstance(workflow, dict) and isinstance(workflow.get("nodes"), list)
+
+
+def is_api_workflow(workflow: Any) -> bool:
+    """True when at least one value is an API-format node ({class_type, …})."""
+    return isinstance(workflow, dict) and any(
+        isinstance(v, dict) and "class_type" in v for v in workflow.values()
+    )
+
+
+def require_api_workflow(workflow: Any) -> None:
+    """Raise a clear 400 when a UI export is supplied where the API graph is
+    required (analyze / generate). Provisioning accepts UI format separately.
+    """
+    if not is_api_workflow(workflow) and is_ui_workflow(workflow):
+        raise openai_error(400, API_FORMAT_HINT)
+
+
 def _iter_api_nodes(workflow: dict) -> Iterator[Tuple[str, str, dict]]:
     """Yield (node_id, class_type, inputs) for API-format workflows."""
     if not isinstance(workflow, dict):
@@ -321,6 +349,7 @@ async def analyze_upload_slots(base_url: str, workflow: dict) -> List[dict]:
     ComfyUI's frontend renders an upload button for. Generic — no hardcoded
     node list. API-format only (that's what /prompt runs and what we wire).
     """
+    require_api_workflow(workflow)
     assert _http is not None, "comfy http client not initialized (lifespan)"
     base = base_url.rstrip("/")
     try:

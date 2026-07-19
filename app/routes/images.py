@@ -24,6 +24,7 @@ from ..comfy import (
     fetch_instance_info,
     fetch_queue,
     make_ephemeral,
+    require_api_workflow,
     resolve_comfy_instance,
     upload_image,
     upload_mask,
@@ -137,6 +138,11 @@ async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
         if request.auto_provision is not None
         else settings.comfy_auto_provision
     )
+
+    # /prompt runs the API-format graph; reject a UI export up front with a
+    # clear message (a raw ComfyUI 400 otherwise). Provisioning accepts UI.
+    if request.workflow:
+        require_api_workflow(request.workflow)
 
     n = max(1, min(request.n, 4))
     if mode == "binary":

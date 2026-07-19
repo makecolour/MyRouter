@@ -189,13 +189,16 @@
                 <label class="form-label" for="cf-negative">Negative prompt</label>
                 <input id="cf-negative" class="form-control" placeholder="(default)">
               </div>
-              <div class="col-12">
-                <label class="form-label" for="cf-workflow">Workflow JSON (optional, overrides the built-in)</label>
-                <textarea id="cf-workflow" class="form-control" rows="3"
-                          placeholder='{"3": {"class_type": "KSampler", ...}}  — placeholders {prompt} {seed} {width} {height}'></textarea>
-              </div>
             </div>
           </details>
+          <label class="form-label" for="cf-workflow">
+            Workflow JSON — <strong>API format</strong> (optional, overrides the built-in)
+          </label>
+          <textarea id="cf-workflow" class="form-control mb-1" rows="4"
+                    placeholder='API format: {"3":{"class_type":"KSampler","inputs":{...}}}. In ComfyUI use Settings → enable Dev mode → "Save (API Format)" — NOT the normal Save (that gives a "nodes"/"links" UI export the API can't run). Placeholders: {prompt} {seed} {width} {height}'></textarea>
+          <p class="text-secondary small mb-2">
+            Provision and Input files below both use this field.
+          </p>
           <div class="mb-2">
             <label class="form-check form-check-inline">
               <input id="cf-auto-provision" class="form-check-input" type="checkbox">
@@ -216,9 +219,9 @@
             <summary>Provision instance (ComfyUI-Manager)</summary>
             <p class="text-secondary small mt-2 mb-1">
               Push a workflow → the Manager installs any missing custom nodes and
-              downloads missing models/embeddings (from a full-graph workflow's
-              top-level <code>models</code> array). Uses the Workflow JSON above,
-              or paste one here.
+              downloads missing models/embeddings (from a UI/full-graph workflow's
+              top-level <code>models</code> array). Provision accepts either the
+              UI export or API format. Uses the Workflow JSON above, or paste one here.
             </p>
             <textarea id="cf-prov-workflow" class="form-control mb-2" rows="3"
                       placeholder="(leave empty to use the Workflow JSON above)"></textarea>
@@ -231,9 +234,10 @@
           <details>
             <summary>Input files (img2img / ControlNet / inpaint)</summary>
             <p class="text-secondary small mt-2 mb-1">
-              Analyze the Workflow JSON above → each node that needs a file gets
-              an upload slot. Uploading wires the filename straight into that
-              node. Ephemeral uploads land in ComfyUI's temp dir.
+              Analyze the <strong>API-format</strong> Workflow JSON above → each
+              node that needs a file gets an upload slot. Uploading wires the
+              filename straight into that node. Ephemeral uploads land in
+              ComfyUI's temp dir.
             </p>
             <button id="cf-analyze" class="btn btn-outline-primary" type="button">Analyze workflow</button>
             <label class="form-check form-check-inline ms-2">
@@ -680,13 +684,26 @@
     });
   }
 
+  var CF_API_HINT = "This is a ComfyUI UI export (has nodes/links). The API needs " +
+    "API format — in ComfyUI: Settings → enable Dev mode → \"Save (API Format)\", " +
+    "then paste that JSON.";
+
+  function cfIsUiWorkflow(wf) {
+    return wf && Array.isArray(wf.nodes) &&
+      !Object.keys(wf).some(function (k) {
+        var v = wf[k]; return v && typeof v === "object" && v.class_type;
+      });
+  }
+
   async function cfAnalyze() {
     var wf = cfParseWorkflow($("cf-workflow").value);
     if (!wf) {
       $("cf-analyze-status").textContent = wf === false
-        ? "Invalid workflow JSON." : "Paste a workflow first.";
+        ? "Invalid workflow JSON."
+        : "Paste an API-format workflow in the Workflow JSON field above first.";
       return;
     }
+    if (cfIsUiWorkflow(wf)) { $("cf-analyze-status").textContent = CF_API_HINT; return; }
     $("cf-analyze").disabled = true;
     $("cf-analyze-status").textContent = "Analyzing…";
     $("cf-slots").innerHTML = "";
@@ -774,6 +791,10 @@
       var wf = cfParseWorkflow($("cf-workflow").value);
       if (wf === false) {
         alertBox($("cf-result"), false, "Workflow JSON is invalid.");
+        $("cf-send").disabled = false; return;
+      }
+      if (cfIsUiWorkflow(wf)) {
+        alertBox($("cf-result"), false, CF_API_HINT);
         $("cf-send").disabled = false; return;
       }
       if (wf) body.workflow = wf;
