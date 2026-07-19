@@ -166,8 +166,8 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
 - **Vision** (ảnh input `image_url`): **chạy được** — sidecar tách part ảnh, ghi file tạm đúng MIME, truyền vào Gemini (`VISION_MAX_IMAGE_MB` giới hạn kích thước). Khi account bị Google rate-limit tạm thời có thể gặp `APIError 1096/1100` (thử lại sau).
 - **Ảnh trong response** (Gemini trả về) → `message.images` (`[{url, title, alt, kind}]`), playground render `<img>`:
-  - **web images** (URL công khai): hiển thị bình thường.
-  - **generated images** (Gemini tự tạo): sidecar cố tải kèm session, nhưng Google **thường 403** URL ảnh generated qua đường web reverse-engineer (giới hạn upstream) → hiện placeholder "không tải được". Ảnh generated đáng tin cần Gemini API chính thức.
+  - **web images** (URL công khai): truyền thẳng URL.
+  - **generated images** (Gemini tự tạo): sidecar tải qua session tối giản (chỉ `__Secure-1PSID`/`PSIDTS` — dùng full jar sẽ bị CDN 403) rồi **nhúng base64** để browser render. Ảnh nào hiếm khi vẫn không tải được thì hiện placeholder.
   - Field `images` ngoài chuẩn OpenAI nên SDK thường bỏ qua an toàn.
 - **Function calling** (`tools` → `tool_calls`): **giả lập bằng prompt** — backend Gemini web không có tool API native. Sidecar nhét schema `tools` vào prompt, model xuất JSON, parse ngược thành `tool_calls` chuẩn OpenAI (`finish_reason:"tool_calls"`); hỗ trợ `tool_choice` auto/required/none/chỉ-định và round-trip `role:"tool"`. Chạy tốt với gemini-3-pro nhưng best-effort (phụ thuộc model bám format). Tắt bằng `TOOL_EMULATION=false`.
 
