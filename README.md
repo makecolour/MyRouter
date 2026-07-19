@@ -217,10 +217,44 @@ const data = await (await fetch(`${BASE}/v1/chat/completions`, {
 })).json();   // data.choices[0].message.content
 ```
 
-**Qua 9Router có một lưu ý:** 9Router luôn stream tới upstream. Client **streaming** (Cursor, Claude Code, Cline, Copilot — chế độ 9Router sinh ra để phục vụ) chạy tốt vì 9Router forward thẳng SSE. Nhưng khi client gọi **non-stream** (`response.json()`), 9Router gom SSE lại thành JSON rồi **ghép nhầm `data: [DONE]` vào sau** → `response.json()` lỗi *"Unexpected non-whitespace character after JSON"*. Đây là **bug của 9Router** (content + usage đã gom đúng, chỉ dư terminator), sidecar không can thiệp được. Cách xử lý:
+**Qua 9Router có một lưu ý:** 9Router luôn stream tới upstream. Client **streaming** (Cursor, Claude Code, Cline, Copilot — chế độ 9Router sinh ra để phục vụ) chạy tốt vì 9Router forward thẳng SSE. Nhưng khi client gọi **non-stream** (`response.json()`), 9Router gom SSE lại thành JSON rồi **ghép nhầm `data: [DONE]` vào sau** → `response.json()` lỗi *"Unexpected non-whitespace character after JSON"*. Đây là **bug của 9Router** (content + usage đã gom đúng, chỉ dư terminator; đã xác nhận 9Router tự hardcode terminator này — sidecar không gỡ được). Cách xử lý:
 - Ưu tiên **dùng streaming** qua 9Router (đúng thiết kế), hoặc
 - **Trỏ client thẳng vào sidecar** cho các provider này (mất fallback/RTK của 9Router nhưng cả hai chế độ sạch), hoặc
 - Parse phòng thủ ở client: `JSON.parse(text.split('data: [DONE]')[0].trim())`.
+
+### Verify nó chạy
+
+Script kiểm tra cả hai chế độ (in ra nội dung thật), cần Node 18+, không cần cài gì:
+
+```bash
+# Qua 9Router (non-stream sẽ tự cắt đuôi "data: [DONE]")
+node scripts/verify.mjs https://9router.montserrat.id.vn/v1 <mr-key> mr/gemini-3-flash
+
+# Hoặc trỏ thẳng sidecar (sạch cả hai chiều)
+node scripts/verify.mjs http://localhost:8000/v1 <google-key> gemini-3-flash
+```
+
+Kỳ vọng: cả **NON-STREAM** lẫn **STREAMING** đều in ra content + `usage`. Nếu cái test SSE của bạn trước đó hiện "(empty)" thì đó là do công cụ chỉ theo dõi kết nối chứ không parse `data:` — script này parse đúng nên sẽ hiện nội dung.
+
+Bản browser-console tương đương (dán vào Console, sửa `URL`/`KEY`):
+
+```js
+const URL_ = "https://9router.montserrat.id.vn/v1/chat/completions", KEY = "<mr-key>";
+const H = { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` };
+const body = m => JSON.stringify({ model: "mr/gemini-3-flash", ...m, messages: [{ role: "user", content: "Reply with exactly: it works" }] });
+// non-stream (cắt đuôi rác)
+const t = await (await fetch(URL_, { method: "POST", headers: H, body: body({}) })).text();
+console.log("NON-STREAM:", JSON.parse(t.split("data: [DONE]")[0].trim()).choices[0].message.content);
+// streaming
+const r = await fetch(URL_, { method: "POST", headers: H, body: body({ stream: true }) });
+const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "", out = "";
+while (true) { const { done, value } = await rd.read(); if (done) break;
+  buf += dec.decode(value, { stream: true }); const ls = buf.split("\n"); buf = ls.pop();
+  for (const l of ls) { const s = l.trim(); if (!s.startsWith("data:")) continue;
+    const p = s.slice(5).trim(); if (p === "[DONE]") continue;
+    try { const d = JSON.parse(p).choices?.[0]?.delta?.content; if (d) out += d; } catch {} } }
+console.log("STREAMING:", out);
+```
 
 ---
 
