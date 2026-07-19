@@ -23,7 +23,7 @@ app/
 ├── security.py        # Bearer auth 2 loại key + request logging
 ├── google_auth.py     # Cầu nối DB↔storage_state, login subprocess, auto re-login
 ├── pool.py            # Pool client NotebookLM/Gemini theo profile (lazy, retry khi expired)
-├── comfy.py           # Workflow builder, info/queue, tải ảnh, ephemeral (temp+xóa history)
+├── comfy.py           # Workflow builder, info/queue, tải ảnh, upload/analyze input, ephemeral
 ├── comfy_provision.py # ComfyUI-Manager V3.41: dò node/model thiếu, cài, poll status
 ├── routes/
 │   ├── chat.py        # /v1/chat/completions + /v1/conversations
@@ -178,6 +178,26 @@ GET /v1/comfy/provision/status   # {done_count, total_count, in_progress_count, 
 - `auto_provision: true` khi generate = chạy `provision(wait=true)` trước rồi mới render (chỉ có tác dụng khi gửi kèm `workflow`).
 - `ephemeral: true` = đổi `SaveImage`→`PreviewImage` (ảnh vào thư mục temp, không vào gallery cố định) **và** xóa entry history sau khi lấy ảnh xong; ảnh vẫn trả về (url/b64/binary) như thường. Bật global bằng `COMFY_EPHEMERAL=true`.
 
+**Nhập ảnh/mask vào ComfyUI (img2img / ControlNet / inpaint)** — phân tích workflow để biết node nào cần file, rồi upload:
+
+```jsonc
+POST /v1/comfy/analyze
+{ "workflow": { } }   // -> { "slots": [{node_id, class_type, input_name, upload_kind, current_value}] }
+// mỗi slot là 1 input nhận file (LoadImage.image…), dò bằng cờ *_upload trong /object_info
+
+POST /v1/comfy/upload
+{ "image": "data:image/png;base64,…" | "https://…",  // ảnh cần nhập
+  "filename": "ref.png",   // tùy chọn; mặc định myrouter_<hex>.<ext>
+  "ephemeral": true,       // upload vào thư mục temp (mặc định COMFY_EPHEMERAL)
+  "mask": false,           // true = /upload/mask, ghép vào alpha của original_ref
+  "original_ref": { } }    // {filename, subfolder, type} của ảnh đã upload (khi mask=true)
+// -> { name, subfolder, type, ref }   // `ref` cắm thẳng vào input LoadImage
+```
+
+- Luồng: `analyze` → với mỗi slot `upload` một file → lấy `ref` gán vào `workflow[node_id].inputs[input_name]` → `generate`.
+- `ref` = tên file (bare) khi vào `input/`, hoặc `"tên [temp]"` khi ephemeral (ComfyUI hiểu annotation `[temp]`/`[output]`).
+- **Ephemeral upload = thư mục temp** (tự dọn, không vào `input/` cố định). ComfyUI **không có API xóa file input** ngay lập tức, nên temp là cơ chế "không lưu" khả dụng (giống ephemeral output).
+
 ### Năng lực chat (Gemini)
 
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
@@ -197,7 +217,7 @@ GET /v1/comfy/provision/status   # {done_count, total_count, in_progress_count, 
 | ComfyUI (mỗi instance) | `http://<host>:<port>/comfyui/v1` | comfy key qua header | đúng instance của key |
 
 - Mỗi surface chỉ phục vụ backend của nó: gửi notebook id vào `/gemini/v1` (hoặc `gemini` vào `/notebooklm/...`) → 404 kèm chỉ dẫn sang surface đúng.
-- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue` + `/comfy/provision` (+ `/status`); lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
+- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue` + `/comfy/provision` (+ `/status`) + `/comfy/analyze` + `/comfy/upload`; lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
 - Bề mặt gộp cũ `/v1/*` giữ nguyên (playground, OpenAI SDK, provider cũ).
 - 9Router chạy trong Docker: dùng `http://172.17.0.1:<port>` (bridge IP) thay vì `localhost`.
 - Lưu ý: key trên URL của surface NotebookLM sẽ xuất hiện trong access log — chỉ dùng trong mạng tin cậy.

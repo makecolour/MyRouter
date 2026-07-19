@@ -99,6 +99,31 @@ class ComfyProvisionRequest(BaseModel):
     timeout: Optional[float] = None
 
 
+class ComfyAnalyzeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # API-format workflow ({"<id>": {"class_type", "inputs"}}). We report which
+    # node inputs take an uploaded file (LoadImage etc.).
+    workflow: dict
+
+
+class ComfyUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # data: URI or http(s) URL of the image/mask to import.
+    image: str
+    # Target filename in ComfyUI; a unique myrouter_<hex><ext> is generated
+    # when omitted.
+    filename: Optional[str] = None
+    # Upload into the temp dir (auto-cleaned, not the permanent input gallery);
+    # the returned `ref` carries the [temp] annotation. Default: COMFY_EPHEMERAL.
+    ephemeral: Optional[bool] = None
+    # Treat as an inpaint mask -> /upload/mask, compositing into original_ref's
+    # alpha. `original_ref` = a prior upload's {filename, subfolder, type}.
+    mask: bool = False
+    original_ref: Optional[dict] = None
+
+
 def _content_to_text(content: Any) -> str:
     """Flatten OpenAI message content (string or content-part list) to text."""
     if isinstance(content, str):
@@ -137,6 +162,28 @@ _MIME_EXT = {
 def _ext_for_mime(mime: str) -> str:
     mime = (mime or "").split(";")[0].strip().lower()
     return _MIME_EXT.get(mime) or mimetypes.guess_extension(mime) or ".bin"
+
+
+def decode_image_source(src: str) -> Tuple[Optional[bytes], str]:
+    """Decode a single image source string to (bytes, ext).
+
+    A `data:` URI is decoded here → (bytes, ext); an http(s) URL returns
+    (None, ext) so the caller fetches the bytes where the shared httpx client
+    lives. Anything else → 400.
+    """
+    src = src or ""
+    if src.startswith("data:"):
+        header, _, b64 = src[len("data:") :].partition(",")
+        mime = header.split(";")[0]
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except (binascii.Error, ValueError):
+            raise openai_error(400, "Invalid base64 image data.")
+        return data, _ext_for_mime(mime)
+    if src.startswith(("http://", "https://")):
+        mime = mimetypes.guess_type(src)[0] or "image/jpeg"
+        return None, _ext_for_mime(mime)
+    raise openai_error(400, "image must be a data: URI or an http(s) URL.")
 
 
 def extract_images(content: Any) -> List[Dict[str, Any]]:

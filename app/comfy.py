@@ -1,10 +1,12 @@
 """ComfyUI integration: instance resolution (DB), workflow build, generate/poll."""
 
 import asyncio
+import json
 import logging
+import mimetypes
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Iterator, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -208,6 +210,156 @@ async def fetch_image_bytes(url: str) -> bytes:
             502, f"Failed to fetch the generated image: {exc}", "api_error"
         )
     return response.content
+
+
+# --------------------------------------------------------------------------
+# Importing input files (images / masks) into ComfyUI's input dir
+# --------------------------------------------------------------------------
+
+
+async def upload_image(
+    base_url: str,
+    data: bytes,
+    filename: str,
+    *,
+    image_type: str = "input",
+    subfolder: str = "",
+    overwrite: bool = True,
+) -> dict:
+    """POST an image to ComfyUI's /upload/image → {name, subfolder, type}.
+
+    `image_type` "temp" lands the file in the auto-cleaned temp dir (ephemeral,
+    not the permanent input gallery); a LoadImage node references it via the
+    annotated ref (see `annotated_ref`).
+    """
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    base = base_url.rstrip("/")
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+    form = {"type": image_type, "overwrite": "true" if overwrite else "false"}
+    if subfolder:
+        form["subfolder"] = subfolder
+    try:
+        resp = await _http.post(
+            f"{base}/upload/image",
+            files={"image": (filename, data, mime)},
+            data=form,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"ComfyUI image upload failed ({base}): {exc}", "api_error"
+        )
+    return resp.json()
+
+
+async def upload_mask(
+    base_url: str,
+    data: bytes,
+    filename: str,
+    original_ref: dict,
+    *,
+    image_type: str = "input",
+    subfolder: str = "",
+    overwrite: bool = True,
+) -> dict:
+    """POST a mask to /upload/mask — composited into `original_ref`'s alpha.
+
+    `original_ref` is a previously-uploaded image's `{filename, subfolder,
+    type}` (i.e. the /upload/image result renamed name→filename).
+    """
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    base = base_url.rstrip("/")
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+    form = {
+        "type": image_type,
+        "overwrite": "true" if overwrite else "false",
+        "original_ref": json.dumps(original_ref),
+    }
+    if subfolder:
+        form["subfolder"] = subfolder
+    try:
+        resp = await _http.post(
+            f"{base}/upload/mask",
+            files={"image": (filename, data, mime)},
+            data=form,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"ComfyUI mask upload failed ({base}): {exc}", "api_error"
+        )
+    return resp.json()
+
+
+def annotated_ref(result: dict) -> str:
+    """Turn an /upload/* result into a LoadImage-ready string.
+
+    Plain input-dir files use the bare name; temp/output files carry the
+    `[type]` annotation ComfyUI's `get_annotated_filepath` understands.
+    """
+    name = result.get("name", "")
+    subfolder = result.get("subfolder") or ""
+    image_type = result.get("type") or "input"
+    path = f"{subfolder}/{name}" if subfolder else name
+    return path if image_type == "input" else f"{path} [{image_type}]"
+
+
+def _iter_api_nodes(workflow: dict) -> Iterator[Tuple[str, str, dict]]:
+    """Yield (node_id, class_type, inputs) for API-format workflows."""
+    if not isinstance(workflow, dict):
+        return
+    for node_id, node in workflow.items():
+        if isinstance(node, dict) and "class_type" in node:
+            yield str(node_id), node["class_type"], node.get("inputs") or {}
+
+
+async def analyze_upload_slots(base_url: str, workflow: dict) -> List[dict]:
+    """Find every node input that takes an uploaded file.
+
+    Uses the instance's own metadata: an input whose options dict carries a
+    truthy `*_upload` flag (e.g. `image_upload` on LoadImage) is exactly what
+    ComfyUI's frontend renders an upload button for. Generic — no hardcoded
+    node list. API-format only (that's what /prompt runs and what we wire).
+    """
+    assert _http is not None, "comfy http client not initialized (lifespan)"
+    base = base_url.rstrip("/")
+    try:
+        resp = await _http.get(f"{base}/object_info")
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise openai_error(
+            502, f"ComfyUI object_info failed ({base}): {exc}", "api_error"
+        )
+    object_info = resp.json()
+    if not isinstance(object_info, dict):
+        return []
+    slots: List[dict] = []
+    for node_id, class_type, inputs in _iter_api_nodes(workflow):
+        info = object_info.get(class_type)
+        if not isinstance(info, dict):
+            continue
+        spec = info.get("input") or {}
+        for section in ("required", "optional"):
+            for input_name, val in (spec.get(section) or {}).items():
+                opts = (
+                    val[1]
+                    if isinstance(val, list) and len(val) > 1 and isinstance(val[1], dict)
+                    else {}
+                )
+                flag = next(
+                    (k for k, v in opts.items() if k.endswith("_upload") and v), None
+                )
+                if flag:
+                    slots.append(
+                        {
+                            "node_id": node_id,
+                            "class_type": class_type,
+                            "input_name": input_name,
+                            "upload_kind": flag[: -len("_upload")],
+                            "current_value": inputs.get(input_name),
+                        }
+                    )
+    return slots
 
 
 def make_ephemeral(workflow: dict) -> dict:

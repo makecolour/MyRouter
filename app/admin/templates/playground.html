@@ -226,6 +226,23 @@
             <span id="cf-prov-status" class="ms-2 text-secondary"></span>
             <pre id="cf-prov-raw" class="pg-response mt-2 d-none"></pre>
           </details>
+
+          <hr class="my-3">
+          <details>
+            <summary>Input files (img2img / ControlNet / inpaint)</summary>
+            <p class="text-secondary small mt-2 mb-1">
+              Analyze the Workflow JSON above → each node that needs a file gets
+              an upload slot. Uploading wires the filename straight into that
+              node. Ephemeral uploads land in ComfyUI's temp dir.
+            </p>
+            <button id="cf-analyze" class="btn btn-outline-primary" type="button">Analyze workflow</button>
+            <label class="form-check form-check-inline ms-2">
+              <input id="cf-upload-ephemeral" class="form-check-input" type="checkbox">
+              <span class="form-check-label">Ephemeral (temp)</span>
+            </label>
+            <span id="cf-analyze-status" class="ms-2 text-secondary"></span>
+            <div id="cf-slots" class="mt-2"></div>
+          </details>
         </div>
       </div>
     </div>
@@ -651,6 +668,92 @@
     $("cf-provision").disabled = false;
   }
 
+  // ---------- ComfyUI: input files (analyze workflow -> per-node upload) ----
+  function cfReadFile(inputEl) {
+    var f = (inputEl.files || [])[0];
+    if (!f) return Promise.resolve(null);
+    return new Promise(function (resolve, reject) {
+      var rd = new FileReader();
+      rd.onload = function () { resolve(rd.result); };  // data:<mime>;base64,…
+      rd.onerror = reject;
+      rd.readAsDataURL(f);
+    });
+  }
+
+  async function cfAnalyze() {
+    var wf = cfParseWorkflow($("cf-workflow").value);
+    if (!wf) {
+      $("cf-analyze-status").textContent = wf === false
+        ? "Invalid workflow JSON." : "Paste a workflow first.";
+      return;
+    }
+    $("cf-analyze").disabled = true;
+    $("cf-analyze-status").textContent = "Analyzing…";
+    $("cf-slots").innerHTML = "";
+    try {
+      var r = await api("/v1/comfy/analyze",
+        { method: "POST", body: JSON.stringify({ workflow: wf }) });
+      if (!r.resp.ok) {
+        $("cf-analyze-status").textContent = errText(r.resp.status, r.data);
+        $("cf-analyze").disabled = false; return;
+      }
+      var slots = r.data.slots || [];
+      if (!slots.length) {
+        $("cf-analyze-status").textContent = "No input files needed by this workflow.";
+      } else {
+        $("cf-analyze-status").textContent = slots.length + " input slot(s) found.";
+        slots.forEach(cfRenderSlot);
+      }
+    } catch (e) { $("cf-analyze-status").textContent = "Request failed: " + e; }
+    $("cf-analyze").disabled = false;
+  }
+
+  function cfRenderSlot(slot) {
+    var row = document.createElement("div");
+    row.className = "input-group input-group-sm mb-1";
+    var label = document.createElement("span");
+    label.className = "input-group-text";
+    label.textContent = "#" + slot.node_id + " " + slot.class_type + "." + slot.input_name;
+    var file = document.createElement("input");
+    file.type = "file"; file.accept = "image/*"; file.className = "form-control";
+    var btn = document.createElement("button");
+    btn.type = "button"; btn.className = "btn btn-outline-secondary";
+    btn.textContent = "Upload";
+    var state = document.createElement("span");
+    state.className = "input-group-text";
+    state.textContent = slot.current_value ? String(slot.current_value) : "(empty)";
+    btn.addEventListener("click", function () { cfUploadSlot(slot, file, btn, state); });
+    [label, file, btn, state].forEach(function (el) { row.appendChild(el); });
+    $("cf-slots").appendChild(row);
+  }
+
+  async function cfUploadSlot(slot, fileEl, btn, stateEl) {
+    var dataUri = await cfReadFile(fileEl);
+    if (!dataUri) { stateEl.textContent = "pick a file first"; return; }
+    btn.disabled = true;
+    stateEl.textContent = "uploading…";
+    try {
+      var body = { image: dataUri, ephemeral: $("cf-upload-ephemeral").checked };
+      var r = await api("/v1/comfy/upload",
+        { method: "POST", body: JSON.stringify(body) });
+      if (!r.resp.ok) {
+        stateEl.textContent = errText(r.resp.status, r.data); btn.disabled = false; return;
+      }
+      var ref = r.data.ref;
+      // Inject the ref into the workflow textarea (single source of truth).
+      var wf = cfParseWorkflow($("cf-workflow").value);
+      if (!wf || !wf[slot.node_id]) {
+        stateEl.textContent = "uploaded " + ref + " (couldn't inject — workflow changed)";
+        btn.disabled = false; return;
+      }
+      wf[slot.node_id].inputs = wf[slot.node_id].inputs || {};
+      wf[slot.node_id].inputs[slot.input_name] = ref;
+      $("cf-workflow").value = JSON.stringify(wf, null, 2);
+      stateEl.textContent = ref;
+    } catch (e) { stateEl.textContent = "failed: " + e; }
+    btn.disabled = false;
+  }
+
   async function cfSend() {
     var prompt = $("cf-prompt").value.trim();
     if (!prompt) return;
@@ -752,6 +855,10 @@
   $("nb-send").addEventListener("click", nbRun);
   $("cf-send").addEventListener("click", cfSend);
   $("cf-provision").addEventListener("click", cfProvision);
+  $("cf-analyze").addEventListener("click", cfAnalyze);
+  $("cf-ephemeral").addEventListener("change", function () {
+    $("cf-upload-ephemeral").checked = $("cf-ephemeral").checked;
+  });
   nbCommandChanged();
 })();
 </script>

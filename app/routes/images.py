@@ -8,12 +8,15 @@ import base64
 import logging
 import random
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 
 from ..comfy import (
+    analyze_upload_slots,
+    annotated_ref,
     apply_workflow_placeholders,
     build_comfy_workflow,
     comfy_generate,
@@ -22,10 +25,19 @@ from ..comfy import (
     fetch_queue,
     make_ephemeral,
     resolve_comfy_instance,
+    upload_image,
+    upload_mask,
 )
 from .. import comfy_provision
 from ..config import settings
-from ..schemas import ComfyProvisionRequest, ImageGenerationRequest, openai_error
+from ..schemas import (
+    ComfyAnalyzeRequest,
+    ComfyProvisionRequest,
+    ComfyUploadRequest,
+    ImageGenerationRequest,
+    decode_image_source,
+    openai_error,
+)
 from ..security import AuthContext, describe_error, log_request, require_comfy_auth
 
 logger = logging.getLogger("ai-sidecar.images")
@@ -305,4 +317,94 @@ async def comfy_provision_status(ctx: AuthContext = Depends(require_comfy_auth))
             status,
             started,
             error,
+        )
+
+
+@router.post("/v1/comfy/analyze")
+async def comfy_analyze(
+    request: ComfyAnalyzeRequest,
+    ctx: AuthContext = Depends(require_comfy_auth),
+):
+    """Discover which workflow node inputs take an uploaded file.
+
+    Returns one slot per file input (LoadImage etc.): its node_id + input_name,
+    so a caller/UI knows exactly where each imported file goes.
+    """
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        slots = await analyze_upload_slots(instance.base_url, request.workflow)
+        status = 200
+        return {"instance": instance.name, "slots": slots}
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(
+            ctx, "/v1/comfy/analyze", ctx.comfy_instance, status, started, error
+        )
+
+
+@router.post("/v1/comfy/upload")
+async def comfy_upload(
+    request: ComfyUploadRequest,
+    ctx: AuthContext = Depends(require_comfy_auth),
+):
+    """Import an image (or inpaint mask) into ComfyUI's input/temp dir.
+
+    Returns the stored `{name, subfolder, type}` plus a LoadImage-ready `ref`
+    (temp uploads carry the `[temp]` annotation). Ephemeral uploads land in the
+    auto-cleaned temp dir instead of the permanent input gallery.
+    """
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        data, ext = decode_image_source(request.image)
+        if data is None:  # http(s) URL — fetch where the shared client lives
+            data = await fetch_image_bytes(request.image)
+        limit = int(settings.vision_max_image_mb * 1024 * 1024)
+        if len(data) > limit:
+            raise openai_error(
+                400,
+                f"Image exceeds the {settings.vision_max_image_mb:.0f} MB limit.",
+            )
+        filename = request.filename or f"myrouter_{uuid.uuid4().hex}{ext}"
+        ephemeral = (
+            request.ephemeral
+            if request.ephemeral is not None
+            else settings.comfy_ephemeral
+        )
+        image_type = "temp" if ephemeral else "input"
+        if request.mask:
+            if not request.original_ref:
+                raise openai_error(
+                    400,
+                    "A mask upload requires original_ref (a prior upload's "
+                    "{filename, subfolder, type}).",
+                )
+            result = await upload_mask(
+                instance.base_url,
+                data,
+                filename,
+                request.original_ref,
+                image_type=image_type,
+            )
+        else:
+            result = await upload_image(
+                instance.base_url, data, filename, image_type=image_type
+            )
+        status = 200
+        return {"instance": instance.name, "ref": annotated_ref(result), **result}
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(
+            ctx, "/v1/comfy/upload", ctx.comfy_instance, status, started, error
         )
