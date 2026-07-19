@@ -117,9 +117,11 @@
     {% if copilot_login_running %}
     <div class="card-body pb-0">
       <div class="alert alert-warning mb-0">
-        A Copilot login is running — finish signing in (and pass any Cloudflare
-        check) in the browser window on the server machine. This page refreshes
-        every 5 seconds.
+        A Copilot login is running — sign in (Microsoft <strong>or Google</strong>)
+        and pass any Cloudflare check in the browser window on the server machine.
+        <strong>If you signed in with Google, type one message (e.g. "hi") and press
+        Enter</strong> — that mints the chat token and finishes the login (the
+        window closes itself). This page refreshes every 5 seconds.
       </div>
       <script>setTimeout(function () { window.location.reload(); }, 5000);</script>
     </div>
@@ -187,6 +189,7 @@
         </div>
         <div class="col-auto align-self-center text-secondary">
           Opens a Microsoft/Google Copilot login window on the server machine (needs a display).
+          With a <strong>Google</strong> account, send one message in the window to finish.
           Cloudflare clearance lasts ~30 min; re-login here if requests start returning 503.
         </div>
       </form>

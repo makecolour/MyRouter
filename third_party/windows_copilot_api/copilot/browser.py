@@ -297,14 +297,24 @@ class BrowserCopilot:
 
         # Wait for sign-in (a cached account), not for the chat token: the token
         # may not exist until the first turn. Bail early on window close/timeout.
+        # MyRouter modification: also break when the chat token is captured off
+        # the WebSocket. Federated *Google* logins don't reliably write the MSAL
+        # account index signed_in() keys off, so that auto-detect can hang; but
+        # the moment the user sends one message, the authenticated chat socket
+        # opens with accessToken= and _captured_chat_token is set — a definitive
+        # signed-in signal (anonymous sockets carry no token, so no false-fire).
         detected = False
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._window_closed():
                 log("browser window closed before sign-in was detected")
                 break
-            if self.signed_in():
-                log("sign-in detected (account cached)")
+            if self.signed_in() or self._captured_chat_token:
+                log(
+                    "sign-in detected "
+                    + ("(chat token captured)" if self._captured_chat_token
+                       else "(account cached)")
+                )
                 detected = True
                 break
             try:

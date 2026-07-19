@@ -224,7 +224,7 @@ DELETE /copilot/v1/conversations/{id}
 ```
 
 - **Năng lực** (đúng những gì thư viện hỗ trợ): text, **streaming**, **conversation**, **1 ảnh input**, **ảnh output** (`message.images`), **function calling giả lập** (`app/tools.py`, như Gemini). Không có: chọn model/mode (mode cố định `"smart"`), upload file khác ảnh, web-search/plugin.
-- **Đăng nhập**: dashboard **Status → Copilot Profiles → Add account & login** → cửa sổ browser Microsoft/Google mở trên máy chủ (**cần màn hình**). Session lưu ở `COPILOT_SESSION_ROOT/<name>/` (git-ignored), DB chỉ giữ trạng thái.
+- **Đăng nhập**: dashboard **Status → Copilot Profiles → Add account & login** → cửa sổ browser Microsoft/Google mở trên máy chủ (**cần màn hình**). Session lưu ở `COPILOT_SESSION_ROOT/<name>/` (git-ignored), DB chỉ giữ trạng thái. **Với tài khoản Google** (federated): sau khi đăng nhập, **gửi 1 tin nhắn** trong cửa sổ — token chat của Google chỉ được cấp ở lượt chat đầu tiên (MSAL cache bị mã hóa), nên đây là bước bắt buộc để hoàn tất (cửa sổ tự đóng, profile → active). Tài khoản Microsoft thì tự động xong.
 - **Cloudflare clearance (~30 phút)**: chỉ lấy được bằng **browser thật**. Trên máy **có màn hình** (PM2 desktop) mọi thứ tự chạy. Trên **VPS headless**, khi clearance hết hạn API trả `503 clearance_required` → phải login lại trên máy có màn hình (chia sẻ session dir). Client pool chạy `interactive_clear=False` để fail-fast 503 thay vì treo server mở browser.
 - **Serialize**: một account xử lý tuần tự (~1–4 request đồng thời); MyRouter khóa `asyncio.Lock` mỗi account. Đây là cầu nối cá nhân, không phải gateway throughput cao.
 
