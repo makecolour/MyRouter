@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     comfy_timeout: float = 300.0
     # Used when the OpenAI-style request says size "auto" (9Router sends this).
     comfy_default_size: str = "1024x1024"
+    # Self-provisioning (ComfyUI-Manager V3.41): auto-install missing nodes /
+    # download missing models before generating when a workflow is supplied.
+    comfy_auto_provision: bool = False
+    comfy_provision_timeout: float = 1800.0  # model downloads are slow
+    # Ephemeral mode: don't persist MyRouter's work on the shared ComfyUI boxes
+    # (SaveImage -> PreviewImage temp output + delete the history entry).
+    comfy_ephemeral: bool = False
 
     # Google auth lifecycle
     profile_sync_interval: float = 600.0  # file -> DB cookie sync period (seconds)

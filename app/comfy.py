@@ -210,6 +210,36 @@ async def fetch_image_bytes(url: str) -> bytes:
     return response.content
 
 
+def make_ephemeral(workflow: dict) -> dict:
+    """Rewrite SaveImage nodes → PreviewImage so outputs land in the temp dir
+    (auto-cleaned, not in the permanent gallery). Returns a shallow-safe copy.
+    """
+    if not isinstance(workflow, dict):
+        return workflow
+    out = {}
+    for key, node in workflow.items():
+        if isinstance(node, dict) and node.get("class_type") == "SaveImage":
+            node = dict(node)
+            node["class_type"] = "PreviewImage"
+            inputs = dict(node.get("inputs", {}))
+            inputs.pop("filename_prefix", None)  # PreviewImage has no such input
+            node["inputs"] = inputs
+        out[key] = node
+    return out
+
+
+async def delete_history(base_url: str, prompt_id: str) -> None:
+    """Drop a prompt from ComfyUI history (best-effort; never raises)."""
+    if _http is None or not prompt_id:
+        return
+    try:
+        await _http.post(
+            f"{base_url.rstrip('/')}/history", json={"delete": [prompt_id]}
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("ComfyUI history delete failed (%s): %s", prompt_id, exc)
+
+
 async def fetch_queue(base_url: str) -> dict:
     """Queue depth of one ComfyUI instance."""
     assert _http is not None, "comfy http client not initialized (lifespan)"
@@ -261,8 +291,15 @@ def apply_workflow_placeholders(
     return substitute(workflow)
 
 
-async def comfy_generate(base_url: str, workflow: dict) -> str:
-    """Queue one generation on a ComfyUI instance, poll history, return the URL."""
+async def comfy_generate(
+    base_url: str, workflow: dict, ephemeral: bool = False
+) -> str:
+    """Queue one generation on a ComfyUI instance, poll history, return the URL.
+
+    When `ephemeral`, the history entry is deleted once the result is
+    retrieved (the workflow should already be `make_ephemeral`-rewritten so the
+    output itself lands in the temp dir).
+    """
     assert _http is not None, "comfy http client not initialized (lifespan)"
 
     payload = {"prompt": workflow, "client_id": uuid.uuid4().hex}
@@ -320,6 +357,8 @@ async def comfy_generate(base_url: str, workflow: dict) -> str:
                 logger.info(
                     "ComfyUI job complete (prompt_id=%s): %s", prompt_id, url
                 )
+                if ephemeral:
+                    await delete_history(base_url, prompt_id)
                 return url
 
     raise openai_error(

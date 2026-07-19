@@ -189,12 +189,43 @@
                 <label class="form-label" for="cf-negative">Negative prompt</label>
                 <input id="cf-negative" class="form-control" placeholder="(default)">
               </div>
+              <div class="col-12">
+                <label class="form-label" for="cf-workflow">Workflow JSON (optional, overrides the built-in)</label>
+                <textarea id="cf-workflow" class="form-control" rows="3"
+                          placeholder='{"3": {"class_type": "KSampler", ...}}  — placeholders {prompt} {seed} {width} {height}'></textarea>
+              </div>
             </div>
           </details>
+          <div class="mb-2">
+            <label class="form-check form-check-inline">
+              <input id="cf-auto-provision" class="form-check-input" type="checkbox">
+              <span class="form-check-label">Auto-provision (install missing nodes/models first)</span>
+            </label>
+            <label class="form-check form-check-inline">
+              <input id="cf-ephemeral" class="form-check-input" type="checkbox">
+              <span class="form-check-label">Ephemeral (don't keep on ComfyUI)</span>
+            </label>
+          </div>
           <button id="cf-send" class="btn btn-primary" type="button">Generate image</button>
           <span id="cf-queue" class="ms-2 text-secondary"></span>
           <div id="cf-result" class="mt-3"></div>
           <pre id="cf-raw" class="pg-response mt-2 d-none"></pre>
+
+          <hr class="my-3">
+          <details>
+            <summary>Provision instance (ComfyUI-Manager)</summary>
+            <p class="text-secondary small mt-2 mb-1">
+              Push a workflow → the Manager installs any missing custom nodes and
+              downloads missing models/embeddings (from a full-graph workflow's
+              top-level <code>models</code> array). Uses the Workflow JSON above,
+              or paste one here.
+            </p>
+            <textarea id="cf-prov-workflow" class="form-control mb-2" rows="3"
+                      placeholder="(leave empty to use the Workflow JSON above)"></textarea>
+            <button id="cf-provision" class="btn btn-outline-primary" type="button">Provision</button>
+            <span id="cf-prov-status" class="ms-2 text-secondary"></span>
+            <pre id="cf-prov-raw" class="pg-response mt-2 d-none"></pre>
+          </details>
         </div>
       </div>
     </div>
@@ -566,6 +597,60 @@
     $("cf-result").appendChild(img);
   }
 
+  // "" -> null (none); valid JSON object -> object; otherwise -> false (error).
+  function cfParseWorkflow(text) {
+    text = (text || "").trim();
+    if (!text) return null;
+    try {
+      var obj = JSON.parse(text);
+      return (obj && typeof obj === "object") ? obj : false;
+    } catch (e) { return false; }
+  }
+
+  async function cfProvision() {
+    var raw = $("cf-prov-workflow").value.trim() || $("cf-workflow").value;
+    var wf = cfParseWorkflow(raw);
+    if (!wf) {
+      $("cf-prov-status").textContent = wf === false
+        ? "Invalid workflow JSON." : "Paste a workflow first.";
+      return;
+    }
+    $("cf-provision").disabled = true;
+    $("cf-prov-status").textContent = "Provisioning… (installs can be slow)";
+    $("cf-prov-raw").classList.add("d-none");
+    try {
+      // wait=false: kick off the install, then poll status.
+      var r = await api("/v1/comfy/provision",
+        { method: "POST", body: JSON.stringify({ workflow: wf, wait: false }) });
+      showRaw($("cf-prov-raw"), r.data);
+      $("cf-prov-raw").classList.remove("d-none");
+      if (!r.resp.ok) {
+        $("cf-prov-status").textContent = errText(r.resp.status, r.data);
+        $("cf-provision").disabled = false; return;
+      }
+      if (r.data.status === "nothing_to_install") {
+        $("cf-prov-status").textContent = "Nothing missing — instance is ready.";
+        $("cf-provision").disabled = false; return;
+      }
+      // Poll the Manager install queue until it drains.
+      for (var i = 0; i < 600; i++) {
+        await new Promise(function (res) { setTimeout(res, 3000); });
+        var s = await api("/v1/comfy/provision/status");
+        if (!s.resp.ok) { $("cf-prov-status").textContent = "Status poll failed."; break; }
+        var q = s.data;
+        $("cf-prov-status").textContent = "Installing… " +
+          (q.done_count || 0) + "/" + (q.total_count || 0) +
+          (q.in_progress_count ? " (" + q.in_progress_count + " in progress)" : "");
+        if (!q.is_processing) {
+          $("cf-prov-status").textContent = "Done — " +
+            (q.done_count || 0) + "/" + (q.total_count || 0) + " installed.";
+          break;
+        }
+      }
+    } catch (e) { $("cf-prov-status").textContent = "Request failed: " + e; }
+    $("cf-provision").disabled = false;
+  }
+
   async function cfSend() {
     var prompt = $("cf-prompt").value.trim();
     if (!prompt) return;
@@ -583,6 +668,14 @@
       if ($("cf-cfg").value) body.cfg = parseFloat($("cf-cfg").value);
       if ($("cf-seed").value) body.seed = parseInt($("cf-seed").value, 10);
       if ($("cf-negative").value.trim()) body.negative_prompt = $("cf-negative").value.trim();
+      var wf = cfParseWorkflow($("cf-workflow").value);
+      if (wf === false) {
+        alertBox($("cf-result"), false, "Workflow JSON is invalid.");
+        $("cf-send").disabled = false; return;
+      }
+      if (wf) body.workflow = wf;
+      if ($("cf-auto-provision").checked) body.auto_provision = true;
+      if ($("cf-ephemeral").checked) body.ephemeral = true;
 
       if (out === "binary") {
         var resp = await fetch("/v1/images/generations", {
@@ -658,6 +751,7 @@
   $("nb-command").addEventListener("change", nbCommandChanged);
   $("nb-send").addEventListener("click", nbRun);
   $("cf-send").addEventListener("click", cfSend);
+  $("cf-provision").addEventListener("click", cfProvision);
   nbCommandChanged();
 })();
 </script>

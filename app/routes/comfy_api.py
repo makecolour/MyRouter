@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends
 from ..schemas import ImageGenerationRequest
 from ..security import AuthContext, describe_error, log_request, require_comfy_auth
 from .images import _handle as images_handle
-from .images import comfy_info, comfy_queue
+from .images import (
+    comfy_info,
+    comfy_provision_endpoint,
+    comfy_provision_status,
+    comfy_queue,
+)
 from .models_list import comfy_model_entries
 
 logger = logging.getLogger("ai-sidecar.comfy-api")
@@ -59,6 +64,10 @@ async def comfyui_generations(
         )
 
 
-# Discovery helpers — same handlers as the legacy surface.
+# Discovery + provisioning — same handlers as the legacy surface.
 router.add_api_route("/comfy/info", comfy_info, methods=["GET"])
 router.add_api_route("/comfy/queue", comfy_queue, methods=["GET"])
+router.add_api_route("/comfy/provision", comfy_provision_endpoint, methods=["POST"])
+router.add_api_route(
+    "/comfy/provision/status", comfy_provision_status, methods=["GET"]
+)

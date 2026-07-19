@@ -23,7 +23,8 @@ app/
 ├── security.py        # Bearer auth 2 loại key + request logging
 ├── google_auth.py     # Cầu nối DB↔storage_state, login subprocess, auto re-login
 ├── pool.py            # Pool client NotebookLM/Gemini theo profile (lazy, retry khi expired)
-├── comfy.py           # Workflow builder, info/queue, tải ảnh
+├── comfy.py           # Workflow builder, info/queue, tải ảnh, ephemeral (temp+xóa history)
+├── comfy_provision.py # ComfyUI-Manager V3.41: dò node/model thiếu, cài, poll status
 ├── routes/
 │   ├── chat.py        # /v1/chat/completions + /v1/conversations
 │   ├── images.py      # /v1/images/generations + /v1/comfy/*
@@ -88,7 +89,7 @@ SECRET_KEY=<chuỗi-ngẫu-nhiên-dài>
 LOGIN_COMMAND=notebooklm login --browser msedge
 ```
 
-Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
+Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `COMFY_AUTO_PROVISION`, `COMFY_PROVISION_TIMEOUT`, `COMFY_EPHEMERAL`, `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
 
 Chạy server:
 
@@ -155,11 +156,27 @@ POST /v1/images/generations
   // knob tùy chọn:
   "checkpoint": "...", "sampler": "...", "scheduler": "...",
   "steps": 25, "cfg": 7.0, "seed": 42, "negative_prompt": "...",
-  "workflow": { }                    // hoặc gửi nguyên workflow ComfyUI (placeholder {prompt}{seed}{width}{height})
+  "workflow": { },                   // hoặc gửi nguyên workflow ComfyUI (placeholder {prompt}{seed}{width}{height})
+  "auto_provision": true,            // cài node/model còn thiếu của workflow trước khi render (mặc định COMFY_AUTO_PROVISION)
+  "ephemeral": true                  // không lưu job trên ComfyUI (mặc định COMFY_EPHEMERAL)
 }
 GET /v1/comfy/info    # checkpoint/sampler/scheduler thật của instance
 GET /v1/comfy/queue   # độ sâu hàng đợi
 ```
+
+**Tự cài đặt instance (ComfyUI-Manager V3.41)** — đẩy một workflow, Manager cài custom node còn thiếu và tải model/embedding còn thiếu:
+
+```jsonc
+POST /v1/comfy/provision
+{ "workflow": { },   // workflow full-graph; mảng `models` top-level [{name,url,directory,hash}] là model cần tải
+  "wait": false,     // true = chờ cài xong mới trả; false = trả ngay, poll status
+  "timeout": 1800 }  // tùy chọn, ghi đè COMFY_PROVISION_TIMEOUT
+GET /v1/comfy/provision/status   # {done_count, total_count, in_progress_count, is_processing}
+```
+
+- Node cần cài lấy từ `class_type` (API-format) hoặc `nodes[].type` (full-graph) không có trong `/object_info`; ánh xạ sang pack cài được qua `getmappings`. Model lấy từ mảng `models` top-level của workflow full-graph — node còn thiếu nhưng resolve được thì báo trong `unresolved_nodes`.
+- `auto_provision: true` khi generate = chạy `provision(wait=true)` trước rồi mới render (chỉ có tác dụng khi gửi kèm `workflow`).
+- `ephemeral: true` = đổi `SaveImage`→`PreviewImage` (ảnh vào thư mục temp, không vào gallery cố định) **và** xóa entry history sau khi lấy ảnh xong; ảnh vẫn trả về (url/b64/binary) như thường. Bật global bằng `COMFY_EPHEMERAL=true`.
 
 ### Năng lực chat (Gemini)
 
@@ -180,7 +197,7 @@ GET /v1/comfy/queue   # độ sâu hàng đợi
 | ComfyUI (mỗi instance) | `http://<host>:<port>/comfyui/v1` | comfy key qua header | đúng instance của key |
 
 - Mỗi surface chỉ phục vụ backend của nó: gửi notebook id vào `/gemini/v1` (hoặc `gemini` vào `/notebooklm/...`) → 404 kèm chỉ dẫn sang surface đúng.
-- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue`; lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
+- `/gemini/v1` có cả `/conversations`; `/comfyui/v1` có cả `/comfy/info` + `/comfy/queue` + `/comfy/provision` (+ `/status`); lệnh artifact NotebookLM vẫn ở surface gộp (`/v1/notebooklm/*`).
 - Bề mặt gộp cũ `/v1/*` giữ nguyên (playground, OpenAI SDK, provider cũ).
 - 9Router chạy trong Docker: dùng `http://172.17.0.1:<port>` (bridge IP) thay vì `localhost`.
 - Lưu ý: key trên URL của surface NotebookLM sẽ xuất hiện trong access log — chỉ dùng trong mạng tin cậy.

@@ -9,6 +9,7 @@ import logging
 import random
 import time
 
+import httpx
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 
@@ -19,10 +20,12 @@ from ..comfy import (
     fetch_image_bytes,
     fetch_instance_info,
     fetch_queue,
+    make_ephemeral,
     resolve_comfy_instance,
 )
+from .. import comfy_provision
 from ..config import settings
-from ..schemas import ImageGenerationRequest, openai_error
+from ..schemas import ComfyProvisionRequest, ImageGenerationRequest, openai_error
 from ..security import AuthContext, describe_error, log_request, require_comfy_auth
 
 logger = logging.getLogger("ai-sidecar.images")
@@ -114,18 +117,37 @@ async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
     instance = await _key_instance(ctx)
     base_url = instance.base_url.rstrip("/")
 
+    ephemeral = (
+        request.ephemeral if request.ephemeral is not None else settings.comfy_ephemeral
+    )
+    auto_provision = (
+        request.auto_provision
+        if request.auto_provision is not None
+        else settings.comfy_auto_provision
+    )
+
     n = max(1, min(request.n, 4))
     if mode == "binary":
         n = 1  # a raw file body can only carry one image
     logger.info(
-        "images -> ComfyUI '%s' (%s) (n=%d, size=%dx%d, mode=%s)",
+        "images -> ComfyUI '%s' (%s) (n=%d, size=%dx%d, mode=%s, ephemeral=%s)",
         instance.name,
         base_url,
         n,
         width,
         height,
         mode,
+        ephemeral,
     )
+
+    # Self-heal: install missing nodes / download missing models the supplied
+    # workflow needs before we try to render with it. Only meaningful with a
+    # caller-supplied workflow (the built-in one uses stock nodes).
+    if auto_provision and request.workflow:
+        report = await comfy_provision.provision(
+            base_url, request.workflow, wait=True
+        )
+        logger.info("auto-provision report: %s", report)
     urls = []
     for index in range(n):
         if request.seed is not None:
@@ -150,8 +172,10 @@ async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
                 scheduler=request.scheduler,
                 denoise=request.denoise,
             )
+        if ephemeral:
+            workflow = make_ephemeral(workflow)
         logger.info("ComfyUI generation %d/%d (seed=%d)", index + 1, n, seed)
-        urls.append(await comfy_generate(base_url, workflow))
+        urls.append(await comfy_generate(base_url, workflow, ephemeral=ephemeral))
 
     if mode == "url":
         return {"created": int(time.time()), "data": [{"url": url} for url in urls]}
@@ -218,3 +242,67 @@ async def comfy_queue(ctx: AuthContext = Depends(require_comfy_auth)):
         raise
     finally:
         log_request(ctx, "/v1/comfy/queue", ctx.comfy_instance, status, started, error)
+
+
+@router.post("/v1/comfy/provision")
+async def comfy_provision_endpoint(
+    request: ComfyProvisionRequest,
+    ctx: AuthContext = Depends(require_comfy_auth),
+):
+    """Push a workflow → ComfyUI-Manager installs missing nodes/models.
+
+    `wait=false` returns immediately once the install queue is started; poll
+    GET /v1/comfy/provision/status for progress.
+    """
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        report = await comfy_provision.provision(
+            instance.base_url,
+            request.workflow,
+            wait=request.wait,
+            timeout=request.timeout,
+        )
+        status = 200
+        return {"instance": instance.name, **report}
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(
+            ctx, "/v1/comfy/provision", ctx.comfy_instance, status, started, error
+        )
+
+
+@router.get("/v1/comfy/provision/status")
+async def comfy_provision_status(ctx: AuthContext = Depends(require_comfy_auth)):
+    """Manager install-queue status (done_count/total_count/is_processing)."""
+    started = time.perf_counter()
+    status = 500
+    error = None
+    try:
+        instance = await _key_instance(ctx)
+        try:
+            queue = await comfy_provision.queue_status(instance.base_url.rstrip("/"))
+        except httpx.HTTPError as exc:
+            raise openai_error(
+                502, f"ComfyUI Manager status failed: {exc}", "api_error"
+            )
+        status = 200
+        return {"instance": instance.name, **queue}
+    except Exception as exc:
+        status = getattr(exc, "status_code", 500)
+        error = describe_error(exc)
+        raise
+    finally:
+        log_request(
+            ctx,
+            "/v1/comfy/provision/status",
+            ctx.comfy_instance,
+            status,
+            started,
+            error,
+        )

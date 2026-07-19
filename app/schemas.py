@@ -76,6 +76,27 @@ class ImageGenerationRequest(BaseModel):
     # wins when both are set.
     response_format: Optional[str] = None
     output_format: Optional[str] = None
+    # ComfyUI-Manager: install missing nodes / download missing models (from the
+    # supplied full-graph `workflow`'s node types + top-level `models` array)
+    # before generating. Defaults to settings.comfy_auto_provision.
+    auto_provision: Optional[bool] = None
+    # Ephemeral: don't persist this job on the ComfyUI box (temp output + delete
+    # history). Defaults to settings.comfy_ephemeral.
+    ephemeral: Optional[bool] = None
+
+
+class ComfyProvisionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # Full-graph workflow (may carry a top-level `models` array of
+    # {name, url, directory, hash}); node class_types + models are what the
+    # Manager installs. Also accepts API-format (nodes detected, no models).
+    workflow: dict
+    # Wait for the install queue to drain before returning; false -> start and
+    # return immediately (poll GET /v1/comfy/provision/status).
+    wait: bool = True
+    # Override settings.comfy_provision_timeout (seconds) for the wait.
+    timeout: Optional[float] = None
 
 
 def _content_to_text(content: Any) -> str:
