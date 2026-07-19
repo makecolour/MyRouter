@@ -14,6 +14,7 @@
   }
   .pg-answer { white-space: pre-wrap; word-break: break-word; }
   .pg-image { max-width: 100%; border-radius: 4px; }
+  .pg-thumb { height: 3rem; border-radius: 4px; margin: 0 0.25rem 0.25rem 0; border: 1px solid var(--tblr-border-color, #e6e7e9); }
   .pg-disabled { opacity: 0.45; pointer-events: none; }
 </style>
 <div class="container-fluid py-3">
@@ -69,6 +70,11 @@
           <div id="gm-conv-status" class="text-secondary mb-2"></div>
           <label class="form-label" for="gm-prompt">Message</label>
           <textarea id="gm-prompt" class="form-control mb-2" rows="3" placeholder="Ask something…"></textarea>
+          <label class="form-label" for="gm-image">Images
+            <span class="text-secondary">(vision — hiện backend Gemini web đang trả 502, xem README)</span>
+          </label>
+          <input id="gm-image" class="form-control mb-1" type="file" accept="image/*" multiple>
+          <div id="gm-image-preview" class="mb-2"></div>
           <button id="gm-send" class="btn btn-primary" type="button">Send</button>
           <div id="gm-answer" class="mt-3"></div>
           <pre id="gm-raw" class="pg-response mt-2 d-none"></pre>
@@ -314,22 +320,49 @@
     }
   }
 
+  // Read the selected image files as OpenAI image_url content parts.
+  function readImageParts() {
+    var files = ($("gm-image").files || []);
+    return Promise.all(Array.prototype.map.call(files, function (f) {
+      return new Promise(function (resolve, reject) {
+        var rd = new FileReader();
+        rd.onload = function () {
+          resolve({ type: "image_url", image_url: { url: rd.result } });
+        };
+        rd.onerror = reject;
+        rd.readAsDataURL(f);  // data:<mime>;base64,…
+      });
+    }));
+  }
+
+  function gmClearImages() {
+    $("gm-image").value = "";
+    $("gm-image-preview").innerHTML = "";
+  }
+
   async function gmSend() {
     var model = $("gm-model").value, msg = $("gm-prompt").value.trim();
-    if (!model || !msg) return;
+    var imageParts = await readImageParts();
+    if (!model || (!msg && !imageParts.length)) return;
     var priorConv = $("gm-conv").value;
     $("gm-send").disabled = true;
     $("gm-answer").textContent = "Waiting…";
     try {
+      // Multimodal content array when images are attached; plain string otherwise.
+      var content = imageParts.length
+        ? [{ type: "text", text: msg }].concat(imageParts)
+        : msg;
       var body = {
         model: model,
-        messages: [{ role: "user", content: msg }],
+        messages: [{ role: "user", content: content }],
         conversation_id: priorConv || "new"
       };
       var r = await api("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
       showRaw($("gm-raw"), r.data);
       if (r.resp.ok) {
-        alertBox($("gm-answer"), true, r.data.choices[0].message.content);
+        var m = r.data.choices[0].message;
+        alertBox($("gm-answer"), true, m.content || JSON.stringify(m.tool_calls || m));
+        gmClearImages();
         if (r.data.conversation_id) {
           localStorage.setItem(convStoreKey(), r.data.conversation_id);
           await loadConversations(r.data.conversation_id);
@@ -579,6 +612,16 @@
     updateConvStatus();
   });
   $("gm-send").addEventListener("click", gmSend);
+  $("gm-image").addEventListener("change", async function () {
+    var parts = await readImageParts();
+    $("gm-image-preview").innerHTML = "";
+    parts.forEach(function (p) {
+      var img = document.createElement("img");
+      img.src = p.image_url.url;
+      img.className = "pg-thumb";
+      $("gm-image-preview").appendChild(img);
+    });
+  });
   $("gm-conv-reset").addEventListener("click", function () {
     $("gm-conv").value = "";
     localStorage.removeItem(convStoreKey());
