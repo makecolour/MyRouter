@@ -32,6 +32,8 @@ _API_KEYS_MIGRATIONS = {
     # v3.5 key kinds: google (profile-bound) vs comfy (instance-bound)
     "key_type": "ADD COLUMN key_type VARCHAR(16) NOT NULL DEFAULT 'google'",
     "comfy_instance": "ADD COLUMN comfy_instance VARCHAR(64) NULL",
+    # v7.0 copilot key kind: bound to a Copilot profile (Microsoft account)
+    "copilot_profile": "ADD COLUMN copilot_profile VARCHAR(255) NULL",
 }
 
 
