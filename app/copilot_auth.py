@@ -136,19 +136,42 @@ async def run_copilot_login(name: str) -> bool:
         command = _build_login_invocation(name)
         logger.info("Starting Copilot login for '%s': %s", name, " ".join(command))
         logger.info("Copilot login progress log: %s", session_dir(name) / "login.log")
-        # PYTHONUNBUFFERED so the vendored login's progress ("A browser window is
-        # open…", "chat token captured…") streams to the PM2 log live instead of
-        # sitting in a block-buffered pipe until the subprocess exits.
+        # Capture the subprocess output and re-log it ourselves — inherited fds
+        # under PM2 don't reliably reach the app log, and the vendored login's
+        # progress ("A browser window is open…", "[copilot] clearance: …",
+        # "chat token captured: yes/no") is the only way to see where it's stuck.
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         proc = None
+        pump_task = None
         try:
-            proc = await asyncio.create_subprocess_exec(*command, env=env)
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+            async def _pump(stream) -> None:
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    logger.info(
+                        "[copilot-login %s] %s",
+                        name,
+                        line.decode("utf-8", "replace").rstrip(),
+                    )
+
+            pump_task = asyncio.create_task(_pump(proc.stdout))
             returncode = await asyncio.wait_for(
                 proc.wait(), timeout=settings.copilot_login_timeout
             )
+            await pump_task
         except asyncio.TimeoutError:
             if proc is not None:
                 proc.kill()
+            if pump_task is not None:
+                pump_task.cancel()
             await set_profile_status(name, "error")
             logger.error(
                 "Copilot login for '%s' timed out after %.0fs",
@@ -157,6 +180,8 @@ async def run_copilot_login(name: str) -> bool:
             )
             return False
         except Exception:
+            if pump_task is not None:
+                pump_task.cancel()
             await set_profile_status(name, "error")
             logger.exception("Copilot login for '%s' failed to run", name)
             return False
