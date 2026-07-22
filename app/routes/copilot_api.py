@@ -114,19 +114,14 @@ async def _input_image(request: ChatCompletionRequest) -> Optional[bytes]:
     return data
 
 
-def _effective_temporary(request: ChatCompletionRequest) -> bool:
-    """Stateless Copilot turns are ephemeral by default (best-effort: the
-    upstream conversation is deleted after the turn — the Copilot backend has no
-    temporary-send flag). A conversation_id request is never ephemeral."""
-    return (
-        request.temporary if request.temporary is not None else settings.chat_temporary
-    )
-
-
 async def _maybe_delete_ephemeral(
-    profile: str, request: ChatCompletionRequest, persist: bool, conversation_id
+    profile: str, persist: bool, conversation_id
 ) -> None:
-    if not persist and _effective_temporary(request):
+    """Stateless Copilot turns are ephemeral by default (best-effort: the upstream
+    conversation is deleted after the turn — the Copilot backend has no
+    temporary-send flag). A conversation_id request persists and is never
+    deleted."""
+    if not persist and settings.chat_temporary:
         await pool_delete_conversation(profile, conversation_id)
 
 
@@ -215,14 +210,14 @@ async def copilot_chat_dispatch(request: ChatCompletionRequest, ctx: AuthContext
         await get_copilot_client(profile)
         return _copilot_stream_response(
             profile, prompt, send_text, lib_conv, image, persist, title,
-            temporary=_effective_temporary(request),
+            temporary=settings.chat_temporary,
         )
 
     reply = await copilot_chat(profile, send_text, lib_conv, image)
     conv_id = reply.conversation_id if persist else None
     await _persist_conversation(conv_id, profile, title)
     await touch_used(profile)
-    await _maybe_delete_ephemeral(profile, request, persist, reply.conversation_id)
+    await _maybe_delete_ephemeral(profile, persist, reply.conversation_id)
     images = _images_to_dicts(reply.images)
     payload = build_chat_response(_MODEL, prompt, reply.text, images=images or None)
     if conv_id:
@@ -239,7 +234,7 @@ async def _copilot_tools(
     conv_id = reply.conversation_id if persist else None
     await _persist_conversation(conv_id, profile, title)
     await touch_used(profile)
-    await _maybe_delete_ephemeral(profile, request, persist, reply.conversation_id)
+    await _maybe_delete_ephemeral(profile, persist, reply.conversation_id)
     tool_calls, cleaned = parse_tool_calls(reply.text, tool_names(request.tools))
     answer = cleaned if tool_calls else reply.text
     if request.stream:

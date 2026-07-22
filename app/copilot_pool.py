@@ -14,7 +14,7 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from .config import settings
-from .copilot_auth import session_dir, session_exists
+from .copilot_auth import run_copilot_login, session_dir, session_exists
 from .copilot_lib import (
     ChatReply,
     ClearanceRequired,
@@ -117,16 +117,56 @@ async def _browser_chat(name: str, prompt: str, conversation_id, image) -> ChatR
         )
     if image is not None:
         logger.warning("Copilot browser chat does not attach input images yet — ignoring.")
+    # Lazy import keeps Playwright off the import path unless browser mode runs.
+    from .copilot_browser_chat import SignInRequired
+
     session_path = str(session_dir(name))
     async with _account_lock(name):
         try:
             text, image_urls, conv = await asyncio.to_thread(
                 _run_browser_turn, session_path, prompt, conversation_id
             )
+        except SignInRequired as exc:
+            text, image_urls, conv = await _reauth_and_retry(
+                name, session_path, prompt, conversation_id, exc
+            )
         except Exception as exc:
             raise _map_copilot_exc(exc, name)
     images = [ImageResponse(u, None, {}) for u in image_urls]
     return ChatReply(text, conv, images)
+
+
+async def _reauth_and_retry(name, session_path, prompt, conversation_id, exc):
+    """A headless turn hit the sign-in wall — re-auth interactively, then retry.
+
+    When ``copilot_browser_interactive_login`` is on, open a VISIBLE browser (the
+    same login the /admin dashboard runs) so the user signs in on the spot, then
+    run the turn once more. Otherwise surface the mapped auth error unchanged.
+    Held under the caller's per-account lock, so no other turn for this account
+    races the login.
+    """
+    if not settings.copilot_browser_interactive_login:
+        raise _map_copilot_exc(exc, name)
+    logger.warning(
+        "Copilot '%s' hit the sign-in wall — opening a browser to re-authenticate.",
+        name,
+    )
+    try:
+        ok = await run_copilot_login(name)
+    except HTTPException:
+        raise  # e.g. 409: another login is already running — surface as-is.
+    except Exception:
+        logger.exception("Copilot auto re-login for '%s' failed", name)
+        raise _map_copilot_exc(exc, name)
+    if not ok:
+        # Login didn't complete (timeout / window closed / no token captured).
+        raise _map_copilot_exc(exc, name)
+    try:
+        return await asyncio.to_thread(
+            _run_browser_turn, session_path, prompt, conversation_id
+        )
+    except Exception as retry_exc:
+        raise _map_copilot_exc(retry_exc, name)
 
 
 async def copilot_chat(

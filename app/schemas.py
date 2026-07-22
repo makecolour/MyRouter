@@ -46,10 +46,6 @@ class ChatCompletionRequest(BaseModel):
     # Function calling (Gemini-only, prompt-emulated). Standard OpenAI shapes.
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Any] = None
-    # Ephemeral session: don't save this chat to the provider's web history.
-    # None -> settings.chat_temporary (default True for stateless). A
-    # conversation_id forces non-temporary (a continued thread must persist).
-    temporary: Optional[bool] = None
 
 
 class ImageGenerationRequest(BaseModel):

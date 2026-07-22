@@ -30,6 +30,15 @@ logger = logging.getLogger("ai-sidecar.copilot-browser")
 _TEMP_CHAT_URL = f"{COPILOT_URL}chats/temporary"
 
 
+class SignInRequired(RuntimeError):
+    """The headless turn landed on Copilot's sign-in wall (session expired).
+
+    A ``RuntimeError`` subclass whose message contains "not signed in", so the
+    pool's ``_map_copilot_exc`` still maps it to a clean profile_auth_expired
+    error by default — but the pool can also catch it specifically to open a
+    visible browser for re-auth (copilot_browser_interactive_login)."""
+
+
 class BrowserChatSession(BrowserCopilot):
     """A headless Copilot chat turn driven through a real browser.
 
@@ -196,8 +205,9 @@ class BrowserChatSession(BrowserCopilot):
                 "browser through a proxy/VPN in a supported region."
             )
         if on_login_wall or not signed_in:
-            # "not signed in" -> profile_auth_expired (re-run login from /admin).
-            return RuntimeError(
+            # "not signed in" -> profile_auth_expired by default; the pool can
+            # instead open a visible browser to re-auth (see SignInRequired).
+            return SignInRequired(
                 "Copilot profile is not signed in or its session expired — "
                 "re-run the Copilot login from the /admin dashboard (Status page)."
             )

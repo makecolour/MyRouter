@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     copilot_chat_mode: str = "browser"  # "browser" | "http"
     copilot_browser_headless: bool = True
     copilot_browser_chat_timeout: float = 120.0
+    # When a browser chat turn lands on Copilot's sign-in wall (the profile's
+    # session expired), open a VISIBLE Playwright window so the user can re-auth
+    # right then, then retry the turn — instead of failing with a "log in from
+    # the dashboard" 502. Enable on a host WITH A DISPLAY; leave OFF on a
+    # headless VPS (launching a visible browser there errors). Reuses the same
+    # interactive login the /admin dashboard runs.
+    copilot_browser_interactive_login: bool = False
 
     # Vision: max size (MB) per input image; larger -> 400.
     vision_max_image_mb: float = 20.0
@@ -92,8 +99,7 @@ class Settings(BaseSettings):
     # Ephemeral chat by default: a stateless chat (no conversation_id) runs as a
     # TEMPORARY session that isn't saved to the provider's web history. Gemini
     # supports this natively; Copilot is best-effort. Using a conversation_id
-    # forces non-temporary (a continued thread must persist). Per-request
-    # override via the `temporary` field.
+    # forces non-temporary (a continued thread must persist).
     chat_temporary: bool = True
 
     log_level: str = "INFO"

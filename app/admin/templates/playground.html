@@ -473,10 +473,8 @@
         ? [{ type: "text", text: msg }].concat(imageParts)
         : msg;
       var body = { model: model, messages: [{ role: "user", content: content }] };
-      if ($("gm-temporary").checked) {
-        body.temporary = true;                 // stateless ephemeral, not saved
-      } else {
-        body.conversation_id = priorConv || "new";
+      if (!$("gm-temporary").checked) {
+        body.conversation_id = priorConv || "new";  // temporary <=> no conversation_id
       }
       var r = await api("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
       showRaw($("gm-raw"), r.data);
@@ -572,10 +570,8 @@
     try {
       var content = imagePart ? [{ type: "text", text: msg }, imagePart] : msg;
       var body = { model: "copilot", messages: [{ role: "user", content: content }] };
-      if ($("cp-temporary").checked) {
-        body.temporary = true;                 // stateless ephemeral (best-effort)
-      } else {
-        body.conversation_id = priorConv || "new";
+      if (!$("cp-temporary").checked) {
+        body.conversation_id = priorConv || "new";  // temporary <=> no conversation_id
       }
       var r = await api("/copilot/v1/chat/completions",
         { method: "POST", body: JSON.stringify(body) });
