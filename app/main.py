@@ -1,4 +1,4 @@
-"""AI Sidecar — multi-tenant, OpenAI-compatible router for 9Router.
+"""MyRouter — multi-tenant, OpenAI-compatible router for 9Router.
 
 Bridges standard OpenAI JSON payloads to:
   * NotebookLM    via `notebooklm-py`     (model = "<notebook_id>")
@@ -97,7 +97,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     comfy.init_http()
     sync_task = asyncio.create_task(_periodic_cookie_sync())
     logger.info(
-        "AI Sidecar started (dashboard: /admin, cookie sync every %.0fs)",
+        "MyRouter started (dashboard: /admin, cookie sync every %.0fs)",
         settings.profile_sync_interval,
     )
     yield
@@ -112,10 +112,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await copilot_pool.close_all()
     await comfy.close_http()
     await engine.dispose()
-    logger.info("AI Sidecar shut down cleanly")
+    logger.info("MyRouter shut down cleanly")
 
 
-app = FastAPI(title="AI Sidecar", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="MyRouter", version="2.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -152,7 +152,7 @@ async def healthz():
 admin = Admin(
     app,
     engine,
-    title="AI Sidecar Admin",
+    title="MyRouter Admin",
     authentication_backend=AdminAuth(secret_key=settings.secret_key),
     templates_dir=str(Path(__file__).parent / "admin" / "templates"),
 )
