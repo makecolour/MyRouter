@@ -111,7 +111,12 @@ class BrowserChatSession(BrowserCopilot):
         self._click_turnstile(timeout_ms=1500)  # page-load gate, if any
 
         if not self._send_message(prompt):
-            raise RuntimeError("Copilot composer not found — the chat UI may have changed.")
+            # Composer absent. Reload once — after a cold restart the SPA often
+            # hasn't hydrated (or a page-load Turnstile hasn't cleared) on the
+            # first paint, and the composer shows up on a second try.
+            self._reload_and_settle()
+            if not self._send_message(prompt):
+                raise self._diagnose_missing_composer()
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -139,6 +144,72 @@ class BrowserChatSession(BrowserCopilot):
             self._page.wait_for_timeout(250)
         # Timed out — return whatever streamed.
         yield ("conversation_id", conversation_id)
+
+    # -- composer-absent recovery / diagnosis --------------------------------
+    def _reload_and_settle(self) -> None:
+        """Reload the page once and re-run the page-load Turnstile gate.
+
+        A cold restart competes for CPU, so the Copilot SPA may not have painted
+        its composer within the selector timeout on first navigation; a plain
+        page-load Cloudflare challenge may also still be resolving. Reloading is
+        cheap and lets both settle before we conclude the composer is gone."""
+        try:
+            self._page.reload(wait_until="domcontentloaded")
+        except Exception:
+            return
+        self._page.wait_for_timeout(1500)
+        self._click_turnstile(timeout_ms=2000)
+
+    def _page_text(self) -> str:
+        try:
+            return (self._page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            ) or "").lower()
+        except Exception:
+            return ""
+
+    def _diagnose_missing_composer(self) -> Exception:
+        """Explain *why* the composer is absent, mapped to an actionable error.
+
+        The pool's ``_map_copilot_exc`` turns these into clean OpenAI-shaped HTTP
+        errors: a ``ClearanceRequired`` -> 503 clearance_required, and a
+        RuntimeError containing "not signed in" -> 502 profile_auth_expired that
+        tells the user to re-run the Copilot login from the /admin dashboard (the
+        visible Playwright window). A blanket "UI changed" reached neither, so a
+        signed-out session after a restart looked like a broken UI."""
+        try:
+            url = (self._page.url or "").lower()
+        except Exception:
+            url = ""
+        on_login_wall = any(
+            h in url
+            for h in ("login.microsoftonline.com", "login.live.com", "/oauth")
+        )
+        try:
+            signed_in = self.signed_in()
+        except Exception:
+            signed_in = False
+
+        if self.region_blocked():
+            return RuntimeError(
+                "Copilot is not available in this session's region — route the "
+                "browser through a proxy/VPN in a supported region."
+            )
+        if on_login_wall or not signed_in:
+            # "not signed in" -> profile_auth_expired (re-run login from /admin).
+            return RuntimeError(
+                "Copilot profile is not signed in or its session expired — "
+                "re-run the Copilot login from the /admin dashboard (Status page)."
+            )
+        if self._find_turnstile_frame() is not None or "just a moment" in self._page_text():
+            return copilot_lib.ClearanceRequired(
+                "Copilot is behind a Cloudflare challenge the headless browser "
+                "could not pass — refresh clearance from the /admin dashboard."
+            )
+        return RuntimeError(
+            "Copilot composer not found — the chat UI may have changed "
+            f"(url={url[:120]})."
+        )
 
     def chat(
         self,
