@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     #   before the visible one. Unreliable on datacenter/VPN IPs.
     copilot_interactive_clear: bool = False
     copilot_headless_clear: bool = False
+    # Chat transport. "browser" (default) drives the actual chat through a
+    # headless Playwright browser — the only mode that works where the host's
+    # curl_cffi TLS can't reuse the browser-earned Cloudflare clearance (the
+    # pure-HTTP driver 503s every turn). "http" uses the vendored curl_cffi
+    # driver (faster, but needs a curl_cffi impersonation whose JA3 Cloudflare
+    # honors for this account).
+    copilot_chat_mode: str = "browser"  # "browser" | "http"
+    copilot_browser_headless: bool = True
+    copilot_browser_chat_timeout: float = 120.0
 
     # Vision: max size (MB) per input image; larger -> 400.
     vision_max_image_mb: float = 20.0

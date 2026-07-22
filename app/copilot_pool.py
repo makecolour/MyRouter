@@ -93,6 +93,42 @@ async def get_copilot_client(name: str) -> SessionCopilotClient:
         return client
 
 
+def _run_browser_turn(session_path: str, prompt: str, conversation_id):
+    """One full browser chat turn (sync Playwright, in a worker thread)."""
+    from .copilot_browser_chat import BrowserChatSession
+
+    with BrowserChatSession(
+        session_path, headless=settings.copilot_browser_headless
+    ) as session:
+        return session.chat(
+            prompt, conversation_id, timeout=int(settings.copilot_browser_chat_timeout)
+        )
+
+
+async def _browser_chat(name: str, prompt: str, conversation_id, image) -> ChatReply:
+    """Drive the chat through a headless browser (see copilot_browser_chat)."""
+    if not session_exists(name):
+        raise openai_error(
+            503,
+            f"No Copilot session for profile '{name}'. Log in from the "
+            f"/admin dashboard (Status page) first.",
+            "server_error",
+            "profile_not_authenticated",
+        )
+    if image is not None:
+        logger.warning("Copilot browser chat does not attach input images yet — ignoring.")
+    session_path = str(session_dir(name))
+    async with _account_lock(name):
+        try:
+            text, image_urls, conv = await asyncio.to_thread(
+                _run_browser_turn, session_path, prompt, conversation_id
+            )
+        except Exception as exc:
+            raise _map_copilot_exc(exc, name)
+    images = [ImageResponse(u, None, {}) for u in image_urls]
+    return ChatReply(text, conv, images)
+
+
 async def copilot_chat(
     name: str,
     prompt: str,
@@ -100,6 +136,8 @@ async def copilot_chat(
     image: Optional[bytes] = None,
 ) -> ChatReply:
     """Full (buffered) reply, serialized per account."""
+    if settings.copilot_chat_mode == "browser":
+        return await _browser_chat(name, prompt, conversation_id, image)
     client = await get_copilot_client(name)
     kwargs = {"image": image} if image is not None else {}
     async with _account_lock(name):
@@ -120,6 +158,16 @@ async def copilot_stream(
     """Yield ('text', str) / ('image', ImageResponse) then a final
     ('conversation_id', str). The per-account lock is held for the whole stream
     (released when this generator is closed), serializing the account."""
+    if settings.copilot_chat_mode == "browser":
+        # Browser turns are buffered (one thread per turn); replay as one chunk.
+        reply = await _browser_chat(name, prompt, conversation_id, image)
+        if reply.text:
+            yield ("text", reply.text)
+        for img in reply.images:
+            yield ("image", img)
+        yield ("conversation_id", reply.conversation_id)
+        return
+
     client = await get_copilot_client(name)
     kwargs = {"image": image} if image is not None else {}
     async with _account_lock(name):
