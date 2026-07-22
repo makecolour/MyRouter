@@ -25,8 +25,6 @@ from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from gemini_webapi import (
-    APIError,
-    GeminiError,
     ModelInvalid,
     TemporarilyBlocked,
     UsageLimitExceeded,

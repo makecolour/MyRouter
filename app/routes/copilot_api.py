@@ -20,9 +20,9 @@ from ..copilot_auth import touch_used
 from ..copilot_pool import (
     copilot_chat,
     copilot_stream,
-    delete_conversation,
     get_copilot_client,
 )
+from ..copilot_pool import delete_conversation as pool_delete_conversation
 from ..db import SessionLocal
 from ..models import CopilotConversation, utcnow
 from ..schemas import (
@@ -127,7 +127,7 @@ async def _maybe_delete_ephemeral(
     profile: str, request: ChatCompletionRequest, persist: bool, conversation_id
 ) -> None:
     if not persist and _effective_temporary(request):
-        await delete_conversation(profile, conversation_id)
+        await pool_delete_conversation(profile, conversation_id)
 
 
 async def _get_conversation(conv_id: str, profile: str) -> Optional[CopilotConversation]:
@@ -310,7 +310,7 @@ def _copilot_stream_response(
                 logger.warning("Failed to persist Copilot conversation %s", final_conv)
         elif temporary and conv_id:
             # Stateless + ephemeral: drop the upstream conversation we created.
-            await delete_conversation(profile, conv_id)
+            await pool_delete_conversation(profile, conv_id)
         yield _sse(
             chunk_id, created, {}, finish="stop",
             conv=final_conv, usage=_usage(prompt, accumulated),

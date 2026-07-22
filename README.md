@@ -23,20 +23,23 @@ app/
 ├── models.py          # ApiKey, Google/CopilotProfile, ComfyInstance, Gemini/CopilotConversation, RequestLog
 ├── security.py        # Bearer auth 3 loại key (google/comfy/copilot) + request logging
 ├── google_auth.py     # Cầu nối DB↔storage_state, login subprocess, auto re-login
-├── copilot_lib.py     # Bọc thư viện vendored: SessionCopilotClient (session_dir mỗi account)
+├── copilot_lib.py     # Bọc thư viện vendored: SessionCopilotClient (session_dir mỗi account, cho http mode)
+├── copilot_browser_chat.py  # Chat qua headless browser (mặc định) — đọc frame appendText từ chat WS
 ├── copilot_auth.py    # Session dir + status + login subprocess (scripts/copilot_login.py)
-├── copilot_pool.py    # Pool client Copilot, khóa serialize mỗi account, to_thread
+├── copilot_pool.py    # Pool Copilot, khóa serialize mỗi account, chọn browser|http mode
 ├── pool.py            # Pool client NotebookLM/Gemini theo profile (lazy, retry khi expired)
 ├── comfy.py           # Workflow builder, info/queue, tải ảnh, upload/analyze input, ephemeral
 ├── comfy_provision.py # ComfyUI-Manager V3.41: dò node/model thiếu, cài, poll status
 ├── routes/
-│   ├── chat.py        # /v1/chat/completions + /v1/conversations
+│   ├── chat.py        # /v1/chat/completions + /v1/conversations (Gemini + NotebookLM)
 │   ├── images.py      # /v1/images/generations + /v1/comfy/*
 │   ├── copilot_api.py # /copilot/v1/* (models, chat, conversations)
+│   ├── gemini_api.py notebooklm_api.py comfy_api.py  # 3 provider surface cho 9Router
 │   ├── models_list.py # /v1/models
 │   └── notebooklm.py  # /v1/notebooklm/* (generate, artifacts, status, download)
-├── third_party/windows_copilot_api/  # thư viện Copilot vendored (MIT, không sửa)
-└── admin/             # Dashboard SQLAdmin (/admin) + API Playground
+├── admin/             # Dashboard SQLAdmin (/admin) + API Playground
+scripts/copilot_login.py            # Đăng nhập Copilot (Playwright) vào session dir mỗi account
+third_party/windows_copilot_api/    # thư viện Copilot vendored (MIT) — có sửa cục bộ (xem header useragent.py)
 ```
 
 ### Ba loại API key (bảng `api_keys`)
@@ -68,10 +71,11 @@ Ba quy tắc quan trọng (đã trả giá để học được):
 
 ## 2. Yêu cầu
 
-- **Windows** có màn hình (login mở cửa sổ browser; Edge/Chrome/Chromium)
-- **Python 3.12+**, **MySQL/MariaDB** chạy local
-- Tài khoản Google đã dùng được Gemini + NotebookLM
-- Các ComfyUI instance truy cập được qua HTTP(S)
+- **Máy có màn hình** (Windows/Linux/macOS) — login Google/Copilot mở cửa sổ browser (Edge/Chrome/Chromium).
+- **Python 3.12+**, **MySQL/MariaDB** chạy local.
+- Tài khoản Google đã dùng được Gemini + NotebookLM.
+- Các ComfyUI instance truy cập được qua HTTP(S).
+- **Copilot** (tuỳ chọn): `playwright install chromium` một lần; chat chạy qua headless browser (xem mục Copilot).
 
 ## 3. Cài đặt & Deploy
 
@@ -96,7 +100,7 @@ SECRET_KEY=<chuỗi-ngẫu-nhiên-dài>
 LOGIN_COMMAND=notebooklm login --browser msedge
 ```
 
-Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `COMFY_AUTO_PROVISION`, `COMFY_PROVISION_TIMEOUT`, `COMFY_EPHEMERAL`, `CHAT_TEMPORARY` (ephemeral chat mặc định), `COPILOT_INTERACTIVE_CLEAR`/`COPILOT_HEADLESS_CLEAR` (tự làm mới Cloudflare clearance), `COPILOT_SESSION_ROOT`, `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
+Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `COMFY_AUTO_PROVISION`, `COMFY_PROVISION_TIMEOUT`, `COMFY_EPHEMERAL`, `CHAT_TEMPORARY` (ephemeral chat mặc định), `COPILOT_CHAT_MODE` (browser|http, mặc định browser), `COPILOT_BROWSER_HEADLESS`, `COPILOT_BROWSER_CHAT_TIMEOUT`, `COPILOT_SESSION_ROOT`, `COPILOT_INTERACTIVE_CLEAR`/`COPILOT_HEADLESS_CLEAR` (chỉ dùng cho http mode), `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
 
 Chạy server:
 
@@ -107,9 +111,10 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### Thiết lập lần đầu (qua dashboard `http://localhost:8000/admin`)
 
 1. **Status** → *Add profile & login* (tick **fresh**) → đăng nhập Google trong cửa sổ browser → auth tự lưu vào DB.
-2. **ComfyUI Instances** → thêm từng instance (name = model string, base_url).
-3. **API Keys** → tạo key `google` (chọn profile) và key `comfy` cho **từng** instance.
-4. **API Playground** → test ngay: chọn key → model tự load → chat/sinh ảnh.
+2. **Status → Copilot Profiles** (tuỳ chọn) → *Add account & login* → đăng nhập Microsoft/Google; nếu là Google, gửi 1 tin nhắn trong cửa sổ để hoàn tất.
+3. **ComfyUI Instances** → thêm từng instance (name = model string, base_url).
+4. **API Keys** → tạo key `google` (chọn profile), `comfy` (từng instance), và `copilot` (chọn Copilot profile).
+5. **API Playground** → test ngay: chọn key → model tự load → chat/sinh ảnh.
 
 Swagger có nút Authorize tại `/docs`. Health check: `/healthz`.
 

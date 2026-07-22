@@ -32,7 +32,6 @@ __all__ = [
     "ImageResponse",
     "SessionCopilotClient",
     "session_paths",
-    "browser_login",
 ]
 
 
@@ -91,19 +90,3 @@ class SessionCopilotClient(CopilotClient):
             cookies=auth["cookies"] if auth else None,
             proxy=self._proxy,
         )
-
-
-def browser_login(session_dir: str, headless: bool = False) -> dict:
-    """Interactive Microsoft/Google sign-in into a per-account session dir.
-
-    Opens a visible browser (needs a display), warms up one turn to mint the
-    chat token + earn Cloudflare clearance, and snapshots `token.json`. Called
-    by the login subprocess (`scripts/copilot_login.py`); returns the auth dict.
-    """
-    from copilot.browser import BrowserCopilot
-
-    auth_path, profile_dir = session_paths(session_dir)
-    Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    return BrowserCopilot(profile_dir=profile_dir, headless=headless).login(
-        path=auth_path
-    )
