@@ -9,40 +9,103 @@ distrusted and the chat socket gates every turn behind a Cloudflare Turnstile.
 Keeping the string here (imported by both :mod:`copilot.driver` and
 :mod:`copilot.browser`) makes drift impossible.
 
-Why these exact values:
+MyRouter modification (self-aligning UA)
+----------------------------------------
+Upstream hardcodes a Windows Chrome 148 UA and asks the maintainer to bump the
+version on every ``playwright install``. That drifts in TWO ways that make
+Cloudflare distrust the earned clearance:
 
-* ``CHROME_UA`` is a real desktop **Windows** Chrome UA. We standardise on the
-  same major version Playwright actually bundles (see the maintenance note), so
-  overriding a launched Chromium's UA to this string does *not* contradict the
-  browser's native ``Sec-CH-UA`` client hint — both say the same version.
-* ``IMPERSONATE_TARGET`` pins curl_cffi to a fixed TLS/HTTP2 fingerprint. Left as
-  the bare ``"chrome"`` alias it tracks curl_cffi's ``DEFAULT_CHROME``, which
-  advances on every upgrade (and ships a *macOS* UA) — a moving target that
-  silently re-breaks the UA match. Pin to the closest stable profile instead; the
-  driver overrides the UA + client hints on top so the wire presentation stays
-  Windows/``CHROME_UA`` regardless of the profile's native UA.
+* **Version**: the constant must match the Chromium major Playwright bundles,
+  else the browser's native ``Sec-CH-UA`` out-drifts the spoofed UA.
+* **OS**: Playwright's ``user_agent`` override changes only the UA *string*, not
+  the browser's ``Sec-CH-UA-Platform`` client hint — which stays the real OS. A
+  hardcoded "Windows" UA on a Linux host is therefore internally contradictory.
 
-MAINTENANCE: bump ``CHROME_UA``'s major version whenever ``playwright install``
-upgrades the bundled Chromium (check ``chromium.launch().version``). If the
-constant lags the real browser, the browser's native ``Sec-CH-UA`` out-drifts the
-spoofed UA and Turnstile sees the mismatch. One line, one place.
+So we derive the UA from the **actual host OS** and the **installed Playwright
+Chromium version** at import: the spoofed UA then agrees with the browser's own
+native client hints (OS + version), the login earns a trusted ``cf_clearance``,
+and the driver replays a byte-identical UA. Self-heals across Playwright
+upgrades — no manual bumping.
+
+``IMPERSONATE_TARGET`` pins curl_cffi's TLS/HTTP2 fingerprint to a fixed profile;
+``cf_clearance`` is bound to the UA (overridden on top), not the TLS profile
+version, so it need not track Chromium exactly.
+
+NOTE for re-vendoring: this file is one of four MyRouter-local modifications to
+the vendored package (with ``browser.py`` login token-capture break and
+``driver.py`` delete_conversation) — re-apply after any upstream re-sync.
 """
 
-# Real desktop Windows Chrome. Must match Playwright's bundled Chromium major
-# version (currently 148) so the UA override introduces no client-hint conflict.
+import json
+import logging
+import os
+import platform
+
+logger = logging.getLogger("ai-sidecar.copilot-ua")
+
+# Fallback Chromium major if detection fails (upstream's pinned value).
+_FALLBACK_MAJOR = 148
+
+
+def _installed_chromium_major() -> int:
+    """Chromium major version Playwright bundles (from its browsers.json)."""
+    try:
+        import playwright
+
+        bj = os.path.join(
+            os.path.dirname(playwright.__file__),
+            "driver", "package", "browsers.json",
+        )
+        with open(bj, encoding="utf-8") as fh:
+            data = json.load(fh)
+        for browser in data.get("browsers", []):
+            if browser.get("name") == "chromium":
+                version = browser.get("browserVersion") or ""  # "149.0.7827.55"
+                major = int(version.split(".")[0])
+                if major > 0:
+                    return major
+    except Exception:
+        pass
+    return _FALLBACK_MAJOR
+
+
+def _os_ua_platform():
+    """(UA platform token, Sec-CH-UA-Platform value) for the real host OS.
+
+    Must match the browser's native ``Sec-CH-UA-Platform`` (Playwright does not
+    override it), so the spoofed UA line and the native hint agree.
+    """
+    system = platform.system()
+    if system == "Linux":
+        return "X11; Linux x86_64", "Linux"
+    if system == "Darwin":
+        return "Macintosh; Intel Mac OS X 10_15_7", "macOS"
+    # Windows (and any unknown OS) -> the widely-common desktop presentation.
+    return "Windows NT 10.0; Win64; x64", "Windows"
+
+
+_MAJOR = _installed_chromium_major()
+_OS_TOKEN, _PLATFORM = _os_ua_platform()
+
 CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+    f"Mozilla/5.0 ({_OS_TOKEN}) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{_MAJOR}.0.0.0 Safari/537.36"
 )
 
 # Client hints that must accompany CHROME_UA so the platform/version a server
-# reads from the hints agrees with the UA line. Used by the curl_cffi driver,
-# which otherwise emits the impersonation profile's native (macOS) hints.
+# reads from the hints agrees with the UA line (and with the browser's native
+# hints). Used by the curl_cffi driver, which otherwise emits the impersonation
+# profile's native hints.
 CHROME_CLIENT_HINTS = {
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua": '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="24"',
+    "sec-ch-ua-platform": f'"{_PLATFORM}"',
+    "sec-ch-ua": (
+        f'"Google Chrome";v="{_MAJOR}", "Chromium";v="{_MAJOR}", '
+        f'"Not_A Brand";v="24"'
+    ),
 }
 
-# Pinned curl_cffi impersonation profile (TLS/HTTP2 fingerprint). Closest stable
-# profile to CHROME_UA's version; the UA itself is overridden on top.
+# Pinned curl_cffi impersonation profile (TLS/HTTP2 fingerprint). The UA itself
+# is overridden on top, so the profile version need not equal _MAJOR.
 IMPERSONATE_TARGET = "chrome146"
+
+logger.info("Copilot UA resolved: %s (platform=%s)", CHROME_UA, _PLATFORM)
