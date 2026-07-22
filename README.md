@@ -71,11 +71,15 @@ Ba quy tắc quan trọng (đã trả giá để học được):
 
 ## 2. Yêu cầu
 
-- **Máy có màn hình** (Windows/Linux/macOS) — login Google/Copilot mở cửa sổ browser (Edge/Chrome/Chromium).
-- **Python 3.12+**, **MySQL/MariaDB** chạy local.
-- Tài khoản Google đã dùng được Gemini + NotebookLM.
-- Các ComfyUI instance truy cập được qua HTTP(S).
-- **Copilot** (tuỳ chọn): `playwright install chromium` một lần; chat chạy qua headless browser (xem mục Copilot).
+**Bắt buộc:** **Python 3.12+** và **MySQL/MariaDB** local.
+
+**Theo backend bạn dùng** (chỉ cần cái nào bạn bật):
+
+| Backend | Cần thêm |
+|---|---|
+| Gemini / NotebookLM | Tài khoản Google (đã dùng được Gemini + NotebookLM) + máy **có màn hình** để login (cửa sổ browser Edge/Chrome/Chromium). |
+| ComfyUI (ảnh) | Ít nhất một ComfyUI instance truy cập được qua HTTP(S). |
+| Copilot | `playwright install chromium` một lần + máy **có màn hình** để login; chat chạy qua headless browser. |
 
 ## 3. Cài đặt & Deploy
 
