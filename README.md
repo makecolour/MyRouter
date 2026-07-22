@@ -96,7 +96,7 @@ SECRET_KEY=<chuỗi-ngẫu-nhiên-dài>
 LOGIN_COMMAND=notebooklm login --browser msedge
 ```
 
-Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `COMFY_AUTO_PROVISION`, `COMFY_PROVISION_TIMEOUT`, `COMFY_EPHEMERAL`, `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
+Các knob khác (đều có mặc định hợp lý): `COMFY_CHECKPOINT`, `COMFY_DEFAULT_SIZE`, `COMFY_STEPS/CFG/NEGATIVE_PROMPT`, `COMFY_POLL_INTERVAL/TIMEOUT`, `COMFY_AUTO_PROVISION`, `COMFY_PROVISION_TIMEOUT`, `COMFY_EPHEMERAL`, `CHAT_TEMPORARY` (ephemeral chat mặc định), `COPILOT_INTERACTIVE_CLEAR`/`COPILOT_HEADLESS_CLEAR` (tự làm mới Cloudflare clearance), `COPILOT_SESSION_ROOT`, `AUTO_RELOGIN` (mặc định bật), `AUTO_RELOGIN_WAIT`, `PROFILE_SYNC_INTERVAL`, `LOGIN_TIMEOUT`, `NOTEBOOK_KEEPALIVE`, `LOG_LEVEL`.
 
 Chạy server:
 
@@ -225,12 +225,14 @@ DELETE /copilot/v1/conversations/{id}
 
 - **Năng lực** (đúng những gì thư viện hỗ trợ): text, **streaming**, **conversation**, **1 ảnh input**, **ảnh output** (`message.images`), **function calling giả lập** (`app/tools.py`, như Gemini). Không có: chọn model/mode (mode cố định `"smart"`), upload file khác ảnh, web-search/plugin.
 - **Đăng nhập**: dashboard **Status → Copilot Profiles → Add account & login** → cửa sổ browser Microsoft/Google mở trên máy chủ (**cần màn hình**). Session lưu ở `COPILOT_SESSION_ROOT/<name>/` (git-ignored), DB chỉ giữ trạng thái. **Với tài khoản Google** (federated): sau khi đăng nhập, **gửi 1 tin nhắn** trong cửa sổ — token chat của Google chỉ được cấp ở lượt chat đầu tiên (MSAL cache bị mã hóa), nên đây là bước bắt buộc để hoàn tất (cửa sổ tự đóng, profile → active). Tài khoản Microsoft thì tự động xong.
-- **Cloudflare clearance (~30 phút)**: chỉ lấy được bằng **browser thật**. Trên máy **có màn hình** (PM2 desktop) mọi thứ tự chạy. Trên **VPS headless**, khi clearance hết hạn API trả `503 clearance_required` → phải login lại trên máy có màn hình (chia sẻ session dir). Client pool chạy `interactive_clear=False` để fail-fast 503 thay vì treo server mở browser.
+- **Cloudflare clearance (~30 phút)**: chỉ lấy được bằng **browser thật**. Trên máy **có màn hình** (PM2 desktop): đặt `COPILOT_INTERACTIVE_CLEAR=true` → khi clearance hết hạn, MyRouter tự mở browser làm mới rồi retry request (chờ ~30s), không trả 503. Trên **VPS headless**: để `false` (mặc định) → clearance hết hạn trả `503 clearance_required`, phải login lại trên máy có màn hình (chia sẻ session dir). `COPILOT_HEADLESS_CLEAR=true` thử làm mới headless im lặng trước (không ổn định trên IP datacenter/VPN).
+- **Ephemeral mặc định** (`CHAT_TEMPORARY=true`): chat stateless (không kèm `conversation_id`) chạy ở chế độ **temporary — không lưu vào lịch sử web**. Gemini hỗ trợ native; Copilot best-effort (xóa conversation upstream sau khi trả lời — backend không có cờ temporary). Gửi kèm `conversation_id` → luôn được lưu (thread cần persist để tiếp tục). Override từng request bằng field `temporary`.
 - **Serialize**: một account xử lý tuần tự (~1–4 request đồng thời); MyRouter khóa `asyncio.Lock` mỗi account. Đây là cầu nối cá nhân, không phải gateway throughput cao.
 
 ### Năng lực chat (Gemini)
 
 - **Text / streaming / conversation**: đầy đủ (xem "Streaming vs non-streaming").
+- **Ephemeral mặc định** (`CHAT_TEMPORARY=true`): chat stateless dùng `generate_content(temporary=True)` → không lưu vào lịch sử Gemini web. Gửi kèm `conversation_id` (hoặc `temporary:false`) → lưu bình thường và tiếp tục được. Playground có checkbox "Temporary".
 - **Vision** (ảnh input `image_url`): **chạy được** — sidecar tách part ảnh, ghi file tạm đúng MIME, truyền vào Gemini (`VISION_MAX_IMAGE_MB` giới hạn kích thước). Khi account bị Google rate-limit tạm thời có thể gặp `APIError 1096/1100` (thử lại sau).
 - **Ảnh trong response** (Gemini trả về) → `message.images` (`[{url, title, alt, kind}]`), playground render `<img>`:
   - **web images** (URL công khai): truyền thẳng URL.

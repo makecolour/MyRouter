@@ -171,6 +171,32 @@ class Copilot(AbstractProvider):
             wss.send(send_frame, CurlWsFlag.TEXT)
             yield from self._read_stream(wss, send_frame, timeout)
 
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        cookies: Dict[str, str] = None,
+        proxy: str = None,
+        timeout: int = 60,
+    ) -> bool:
+        """Best-effort DELETE of a conversation (MyRouter addition, for ephemeral
+        turns). REST calls authenticate by COOKIE only, same as the create call.
+        Returns True on a 2xx; never raises for a missing endpoint."""
+        if not conversation_id:
+            return False
+        try:
+            with Session(
+                timeout=timeout,
+                proxy=proxy,
+                impersonate=IMPERSONATE_TARGET,
+                headers={"User-Agent": CHROME_UA, **CHROME_CLIENT_HINTS},
+                cookies=cookies,
+            ) as session:
+                session.get(f"{self.url}/")
+                resp = session.delete(f"{self.conversation_url}/{conversation_id}")
+                return 200 <= resp.status_code < 300
+        except Exception:
+            return False
+
     def _read_stream(self, wss, send_frame: bytes, timeout: int, idle_timeout: int = 60):
         """Consume chat-socket frames, solving challenges, yielding text/images.
 

@@ -412,6 +412,18 @@ async def _extract_gemini_images(result, gclient=None) -> List[dict]:
                 pass
 
 
+def _effective_temporary(request: ChatCompletionRequest) -> bool:
+    """Whether a STATELESS chat should run as a temporary (unsaved) session.
+
+    Only meaningful for stateless calls — a conversation (chat session) always
+    persists so it can be continued, so callers apply this only when session is
+    None.
+    """
+    return (
+        request.temporary if request.temporary is not None else settings.chat_temporary
+    )
+
+
 async def _gemini_chat(
     request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
 ) -> Tuple[str, Optional[str], List[dict]]:
@@ -433,7 +445,10 @@ async def _gemini_chat(
         try:
             if session is None:
                 result = await client.generate_content(
-                    send_text, files=files or None, **model_kwargs
+                    send_text,
+                    files=files or None,
+                    temporary=_effective_temporary(request),
+                    **model_kwargs,
                 )
             else:
                 result = await session.send_message(send_text, files=files or None)
@@ -477,7 +492,10 @@ async def _gemini_chat_tools(
         try:
             if session is None:
                 result = await client.generate_content(
-                    send_text, files=files or None, **model_kwargs
+                    send_text,
+                    files=files or None,
+                    temporary=_effective_temporary(request),
+                    **model_kwargs,
                 )
             else:
                 result = await session.send_message(send_text, files=files or None)
@@ -582,6 +600,9 @@ async def _gemini_stream_response(
             stream_kwargs = dict(model_kwargs)
             if session is not None:
                 stream_kwargs["chat"] = session
+            else:
+                # Stateless -> ephemeral by default (not saved to web history).
+                stream_kwargs["temporary"] = _effective_temporary(request)
             async for output in client.generate_content_stream(
                 send_text, files=files or None, **stream_kwargs
             ):

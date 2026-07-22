@@ -75,6 +75,10 @@
           </label>
           <input id="gm-image" class="form-control mb-1" type="file" accept="image/*" multiple>
           <div id="gm-image-preview" class="mb-2"></div>
+          <label class="form-check mb-2" title="Stateless one-off, not saved to your Gemini web history (ignores the conversation dropdown)">
+            <input id="gm-temporary" class="form-check-input" type="checkbox">
+            <span class="form-check-label">Temporary (don't save to history)</span>
+          </label>
           <button id="gm-send" class="btn btn-primary" type="button">Send</button>
           <div id="gm-answer" class="mt-3"></div>
           <div id="gm-answer-images" class="mt-2"></div>
@@ -273,6 +277,10 @@
             <span class="text-secondary">(one image; Copilot reads it)</span>
           </label>
           <input id="cp-image" class="form-control mb-2" type="file" accept="image/*">
+          <label class="form-check mb-2" title="Stateless one-off; best-effort deletes the upstream conversation after (ignores the conversation dropdown)">
+            <input id="cp-temporary" class="form-check-input" type="checkbox">
+            <span class="form-check-label">Temporary (don't save — best-effort)</span>
+          </label>
           <button id="cp-send" class="btn btn-primary" type="button">Send</button>
           <div id="cp-answer" class="mt-3"></div>
           <div id="cp-answer-images" class="mt-2"></div>
@@ -464,11 +472,12 @@
       var content = imageParts.length
         ? [{ type: "text", text: msg }].concat(imageParts)
         : msg;
-      var body = {
-        model: model,
-        messages: [{ role: "user", content: content }],
-        conversation_id: priorConv || "new"
-      };
+      var body = { model: model, messages: [{ role: "user", content: content }] };
+      if ($("gm-temporary").checked) {
+        body.temporary = true;                 // stateless ephemeral, not saved
+      } else {
+        body.conversation_id = priorConv || "new";
+      }
       var r = await api("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
       showRaw($("gm-raw"), r.data);
       if (r.resp.ok) {
@@ -562,11 +571,12 @@
     $("cp-answer").textContent = "Waiting…";
     try {
       var content = imagePart ? [{ type: "text", text: msg }, imagePart] : msg;
-      var body = {
-        model: "copilot",
-        messages: [{ role: "user", content: content }],
-        conversation_id: priorConv || "new"
-      };
+      var body = { model: "copilot", messages: [{ role: "user", content: content }] };
+      if ($("cp-temporary").checked) {
+        body.temporary = true;                 // stateless ephemeral (best-effort)
+      } else {
+        body.conversation_id = priorConv || "new";
+      }
       var r = await api("/copilot/v1/chat/completions",
         { method: "POST", body: JSON.stringify(body) });
       showRaw($("cp-raw"), r.data);

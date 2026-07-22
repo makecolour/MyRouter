@@ -82,7 +82,10 @@ async def get_copilot_client(name: str) -> SessionCopilotClient:
         logger.info("Creating Copilot client for '%s'…", name)
         client = SessionCopilotClient(
             str(session_dir(name)),
-            interactive_clear=False,  # never pop a browser from a pooled request
+            # On a display host, interactive_clear lets an expired clearance be
+            # refreshed via a browser popup + retry; on a headless VPS keep it
+            # off so a stale clearance fails fast (503) instead of hanging.
+            interactive_clear=settings.copilot_interactive_clear,
             headless_clear=settings.copilot_headless_clear,
         )
         copilot_clients[name] = client
@@ -138,6 +141,33 @@ async def copilot_stream(
             elif isinstance(item, ImageResponse):
                 yield ("image", item)
         yield ("conversation_id", stream_obj.conversation_id)
+
+
+async def delete_conversation(name: str, conversation_id: Optional[str]) -> None:
+    """Best-effort delete of an upstream conversation (ephemeral/temporary turn).
+
+    Never raises — an unremoved conversation is a documented limitation, not an
+    error. Serialized per account like every other upstream call.
+    """
+    if not conversation_id:
+        return
+    try:
+        client = await get_copilot_client(name)
+        async with _account_lock(name):
+            ok = await asyncio.to_thread(client.delete_conversation, conversation_id)
+        logger.info(
+            "Copilot ephemeral: delete conversation %s for '%s' -> %s",
+            conversation_id,
+            name,
+            "ok" if ok else "not removed",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Copilot conversation delete failed (%s, %s): %s",
+            name,
+            conversation_id,
+            exc,
+        )
 
 
 def invalidate_profile(name: str) -> None:

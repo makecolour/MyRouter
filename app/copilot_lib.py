@@ -83,6 +83,15 @@ class SessionCopilotClient(CopilotClient):
         finally:
             bot.close()
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Best-effort delete of an upstream conversation (ephemeral turns)."""
+        auth = self._fresh_auth()
+        return self._driver.delete_conversation(
+            conversation_id,
+            cookies=auth["cookies"] if auth else None,
+            proxy=self._proxy,
+        )
+
 
 def browser_login(session_dir: str, headless: bool = False) -> dict:
     """Interactive Microsoft/Google sign-in into a per-account session dir.

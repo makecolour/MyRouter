@@ -63,10 +63,15 @@ class Settings(BaseSettings):
     # The account's session dir is always appended as the final argument.
     copilot_login_command: str = ""
     copilot_login_timeout: float = 600.0
-    # Try a HEADLESS Cloudflare-clearance refresh on expiry before giving up.
-    # Default off: headless Turnstile solving is unreliable and can hang a
-    # request; off -> stale clearance fails fast with 503 clearance_required
-    # (re-clear via the dashboard/CLI login on a machine with a display).
+    # When a chat hits an expired Cloudflare clearance, refresh it automatically:
+    # - copilot_interactive_clear: open a VISIBLE browser mid-request to re-clear
+    #   and retry (the library's default recovery). Enable on a host WITH A
+    #   DISPLAY — the request blocks ~30s while a browser pops up, passes the
+    #   check, and retries. Leave OFF on a headless VPS (it would hang the
+    #   request), where a stale clearance fails fast with 503 clearance_required.
+    # - copilot_headless_clear: try a HEADLESS refresh first (silent, no popup)
+    #   before the visible one. Unreliable on datacenter/VPN IPs.
+    copilot_interactive_clear: bool = False
     copilot_headless_clear: bool = False
 
     # Vision: max size (MB) per input image; larger -> 400.
@@ -74,6 +79,13 @@ class Settings(BaseSettings):
     # Function calling for Gemini is prompt-EMULATED (the web backend has no
     # native tool API). False -> ignore `tools` and answer as plain chat.
     tool_emulation: bool = True
+
+    # Ephemeral chat by default: a stateless chat (no conversation_id) runs as a
+    # TEMPORARY session that isn't saved to the provider's web history. Gemini
+    # supports this natively; Copilot is best-effort. Using a conversation_id
+    # forces non-temporary (a continued thread must persist). Per-request
+    # override via the `temporary` field.
+    chat_temporary: bool = True
 
     log_level: str = "INFO"
 
