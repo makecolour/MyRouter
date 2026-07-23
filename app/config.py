@@ -82,6 +82,19 @@ class Settings(BaseSettings):
     copilot_chat_mode: str = "browser"  # "browser" | "http"
     copilot_browser_headless: bool = True
     copilot_browser_chat_timeout: float = 120.0
+    # Browser turns terminate on the chat socket's `done` frame; these two guards
+    # keep a turn from waiting out the whole `chat_timeout` when that frame is
+    # missed — the cause of multi-minute "completions" that are really just the
+    # read loop stalling until the ceiling:
+    #   * idle_timeout: once the reply has STARTED streaming, stop after this many
+    #     seconds with no new frame. Copilot streams tokens sub-second, so a gap
+    #     this long means the turn finished (or wedged) even without a `done`.
+    #   * first_frame_timeout: if NO reply frame arrives within this many seconds
+    #     of sending, the composer submit likely no-op'd (a large prompt can set
+    #     the composer value without the SPA registering it) — re-send once if the
+    #     prompt is still sitting unsent, otherwise give up instead of hanging.
+    copilot_browser_idle_timeout: float = 15.0
+    copilot_browser_first_frame_timeout: float = 45.0
     # When a browser chat turn lands on Copilot's sign-in wall (the profile's
     # session expired), open a VISIBLE Playwright window so the user can re-auth
     # right then, then retry the turn — instead of failing with a "log in from

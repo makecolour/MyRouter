@@ -101,7 +101,11 @@ def _run_browser_turn(session_path: str, prompt: str, conversation_id):
         session_path, headless=settings.copilot_browser_headless
     ) as session:
         return session.chat(
-            prompt, conversation_id, timeout=int(settings.copilot_browser_chat_timeout)
+            prompt,
+            conversation_id,
+            timeout=int(settings.copilot_browser_chat_timeout),
+            idle_timeout=float(settings.copilot_browser_idle_timeout),
+            first_frame_timeout=float(settings.copilot_browser_first_frame_timeout),
         )
 
 

@@ -102,9 +102,26 @@ class BrowserChatSession(BrowserCopilot):
         prompt: str,
         conversation_id: Optional[str] = None,
         timeout: int = 120,
+        idle_timeout: float = 15.0,
+        first_frame_timeout: float = 45.0,
     ) -> Iterator[Tuple[str, object]]:
         """Yield ('text', str) / ('image', url) as the reply streams, then
-        ('conversation_id', id). One turn per call."""
+        ('conversation_id', id). One turn per call.
+
+        Termination is layered so a turn can never silently burn the whole
+        ``timeout`` budget when the terminal ``done`` frame is missed — the
+        pathology behind multi-minute "completions" that are really just this
+        loop waiting out the clock:
+
+          * ``done`` / ``error`` frame       -> exit at once (the happy path);
+          * streaming started, then ``idle_timeout`` s with no new frame -> the
+            reply is complete (Copilot streams tokens sub-second, so a gap this
+            long means the turn finished) — stop and return what streamed;
+          * NO frame within ``first_frame_timeout`` s -> the composer submit
+            likely no-op'd; re-send once if the prompt is still sitting unsent,
+            otherwise give up (don't hang) — a zero-frame turn is a dead turn;
+          * ``timeout``                       -> hard ceiling, unchanged.
+        """
         self._ensure_started()
         self._install_ws_listener()
         self._buffer = b""
@@ -128,17 +145,24 @@ class BrowserChatSession(BrowserCopilot):
                 raise self._diagnose_missing_composer()
 
         deadline = time.time() + timeout
+        started = False           # have we seen the first reply frame?
+        resent = False            # re-sent once after a silent send?
+        last_activity = time.time()
         while time.time() < deadline:
+            drained_any = False
             while self._pending:
+                drained_any = True
                 msg = self._pending.popleft()
                 event = msg.get("event")
                 if event == "appendText":
                     text = msg.get("text")
                     if text:
+                        started = True
                         yield ("text", text)
                 elif event == "imageGenerated":
                     u = msg.get("url")
                     if u:
+                        started = True
                         yield ("image", u)
                 elif event == "done":
                     yield ("conversation_id", conversation_id)
@@ -147,12 +171,68 @@ class BrowserChatSession(BrowserCopilot):
                     raise RuntimeError(
                         f"Copilot error frame: {msg.get('errorCode') or msg}"
                     )
+            now = time.time()
+            if drained_any:
+                last_activity = now
+            idle = now - last_activity
+            if started:
+                # Reply streamed, then the socket went quiet with no `done`:
+                # Copilot emits tokens sub-second while generating, so a gap this
+                # long means the turn is finished (or wedged) — stop waiting.
+                if idle >= idle_timeout:
+                    logger.info(
+                        "Copilot turn idle %.1fs after streaming — treating as done.",
+                        idle,
+                    )
+                    break
+            elif idle >= first_frame_timeout:
+                # No reply frame at all. A large prompt can set the composer value
+                # without the SPA registering the submit; re-send once if it's
+                # still sitting there, else give up rather than run out the clock.
+                if not resent and self._resend_if_unsent(prompt):
+                    resent = True
+                    last_activity = time.time()
+                    continue
+                logger.warning(
+                    "Copilot turn produced no reply within %.0fs — giving up.",
+                    first_frame_timeout,
+                )
+                break
             # Click any in-chat Turnstile that appears; pump the sync event loop
             # so framereceived handlers fire and append to _pending.
             self._click_turnstile(timeout_ms=300)
             self._page.wait_for_timeout(250)
-        # Timed out — return whatever streamed.
+        # Idle-stopped, gave up, or hit the ceiling — return whatever streamed.
         yield ("conversation_id", conversation_id)
+
+    # -- send verification ---------------------------------------------------
+    def _composer_text(self) -> str:
+        """Current text in Copilot's composer ('' if empty or unreadable).
+
+        A successful submit CLEARS the composer, so non-empty text here means the
+        send never registered. Returns '' on any failure so we never re-send on a
+        guess (the conservative choice — a false empty just skips the retry)."""
+        for sel in ("textarea", "div[contenteditable='true']", "[role='textbox']"):
+            try:
+                el = self._page.query_selector(sel)
+                if el is None:
+                    continue
+                val = el.input_value() if sel == "textarea" else el.inner_text()
+                return (val or "").strip()
+            except Exception:
+                continue
+        return ""
+
+    def _resend_if_unsent(self, prompt: str) -> bool:
+        """Re-submit the prompt only when it's still sitting unsent in the composer.
+
+        Guards against double-sending: a successful submit clears the composer, so
+        we retry *solely* when we can still see text there — never merely because
+        Copilot is slow to start replying (that path leaves the composer empty)."""
+        if not self._composer_text():
+            return False  # composer empty -> the send did land; don't double-send
+        logger.info("Copilot composer still holds text after send — re-sending once.")
+        return self._send_message(prompt)
 
     # -- composer-absent recovery / diagnosis --------------------------------
     def _reload_and_settle(self) -> None:
@@ -226,12 +306,16 @@ class BrowserChatSession(BrowserCopilot):
         prompt: str,
         conversation_id: Optional[str] = None,
         timeout: int = 120,
+        idle_timeout: float = 15.0,
+        first_frame_timeout: float = 45.0,
     ) -> Tuple[str, List[str], Optional[str]]:
         """Buffered turn → (text, image_urls, conversation_id)."""
         parts: List[str] = []
         images: List[str] = []
         conv = conversation_id
-        for kind, val in self.run_turn(prompt, conversation_id, timeout):
+        for kind, val in self.run_turn(
+            prompt, conversation_id, timeout, idle_timeout, first_frame_timeout
+        ):
             if kind == "text":
                 parts.append(val)
             elif kind == "image":
