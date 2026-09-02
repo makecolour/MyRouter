@@ -9,11 +9,18 @@ models (gemini-3-pro); inherently best-effort.
 import json
 import re
 import uuid
-from typing import Any, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 _FENCE_RE = re.compile(
-    r"```(?:tool_calls|json)?\s*(\[.*?\]|\{.*?\})\s*```", re.DOTALL | re.IGNORECASE
+    r"```(?:tool_calls?|function_calls?|json)?\s*(\[.*?\]|\{.*?\})\s*```",
+    re.DOTALL | re.IGNORECASE,
 )
+# Models that ignore the fence still tend to emit the JSON somewhere in the
+# reply, so a bracket scan is the last resort before giving up.
+_JSON_START_RE = re.compile(r"[\[{]")
+# OpenAI says "arguments"; emulated models reach for whatever the schema called
+# it. All of these mean the same thing.
+_ARG_ALIASES = ("arguments", "args", "parameters", "input", "params")
 
 
 def tool_names(tools: Optional[List[dict]]) -> List[str]:
@@ -36,6 +43,45 @@ def tools_requested(tools: Optional[List[dict]], tool_choice: Any) -> bool:
     return True
 
 
+# Schema keys that carry no information the model needs in order to emit a
+# valid call. An agentic client sends dozens of tools at once, and dumping every
+# full schema inflates the prompt to the point where Google silently aborts the
+# generation — so these go, and prose is trimmed. Names, types, `required` and
+# `enum` are what actually constrain the output.
+_SCHEMA_NOISE = frozenset(
+    {"$schema", "$id", "title", "additionalProperties", "default", "examples"}
+)
+_DESC_LIMIT = 200
+# Below this nesting depth, a property's prose is dead weight: the model needs
+# the shape of a nested object, not an essay about each leaf.
+_DESC_MAX_DEPTH = 2
+
+
+def _compact_schema(node: Any, depth: int = 0) -> Any:
+    """Strip a JSON Schema down to what constrains a generated call."""
+    if isinstance(node, list):
+        return [_compact_schema(item, depth) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    for key, value in node.items():
+        if key in _SCHEMA_NOISE:
+            continue
+        if key == "description":
+            if depth > _DESC_MAX_DEPTH or not isinstance(value, str):
+                continue
+            text = value.strip()
+            if len(text) > _DESC_LIMIT:
+                text = text[:_DESC_LIMIT].rstrip() + "…"
+            if text:
+                out[key] = text
+            continue
+        # "properties" holds tool-defined names, so its keys are data, not
+        # schema keywords — descend without treating them as such.
+        out[key] = _compact_schema(value, depth + 1)
+    return out
+
+
 def build_tool_instruction(tools: List[dict], tool_choice: Any) -> str:
     """A protocol block describing the tools + the exact output contract."""
     lines = [
@@ -56,7 +102,7 @@ def build_tool_instruction(tools: List[dict], tool_choice: Any) -> str:
         fn = tool.get("function") or {} if isinstance(tool, dict) else {}
         name = fn.get("name", "?")
         desc = fn.get("description", "")
-        params = fn.get("parameters", {})
+        params = _compact_schema(fn.get("parameters", {}))
         lines.append(f"- {name}: {desc}")
         lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
@@ -70,18 +116,91 @@ def build_tool_instruction(tools: List[dict], tool_choice: Any) -> str:
             lines.append("")
             lines.append(f"You MUST call the tool `{forced}` for this turn.")
 
+    # This block is appended AFTER the conversation, so the contract is the last
+    # thing read before generation rather than being buried tens of KB above it.
+    lines.append("")
+    lines.append(
+        "Reminder: to call a tool, output ONLY the ```tool_calls fenced JSON "
+        "array and nothing else."
+    )
+
     return "\n".join(lines)
+
+
+def build_repair_instruction(tools: List[dict], tool_choice: Any) -> str:
+    """A terse re-ask for when the model ignored the contract entirely."""
+    names = ", ".join(tool_names(tools)) or "the available tools"
+    forced = ""
+    if isinstance(tool_choice, dict):
+        forced_name = (tool_choice.get("function") or {}).get("name")
+        if forced_name:
+            forced = f" You must call `{forced_name}`."
+    return (
+        "Your previous reply did not follow the tool-calling format." + forced + "\n"
+        "Reply again with ONLY a fenced code block labelled tool_calls holding a "
+        'JSON array of {"name": ..., "arguments": {...}} objects — no prose, no '
+        "explanation, nothing outside the fence. Valid tool names: " + names + ".\n"
+        "If genuinely no tool applies, answer the user's question directly instead."
+    )
 
 
 def _coerce_calls(parsed: Any) -> List[dict]:
     if isinstance(parsed, dict):
         # Either a single {name, arguments} or {"tool_calls": [...]}.
-        if "tool_calls" in parsed and isinstance(parsed["tool_calls"], list):
-            return [c for c in parsed["tool_calls"] if isinstance(c, dict)]
+        for key in ("tool_calls", "function_calls", "calls"):
+            if isinstance(parsed.get(key), list):
+                return [c for c in parsed[key] if isinstance(c, dict)]
         return [parsed]
     if isinstance(parsed, list):
         return [c for c in parsed if isinstance(c, dict)]
     return []
+
+
+def _call_arguments(call: dict) -> Any:
+    # A model echoing OpenAI's own wire shape nests both name and arguments
+    # under "function"; look there too before falling back to an empty object.
+    sources = [call]
+    if isinstance(call.get("function"), dict):
+        sources.append(call["function"])
+    for source in sources:
+        for alias in _ARG_ALIASES:
+            if alias in source:
+                return source[alias]
+    return {}
+
+
+def _iter_json_spans(text: str) -> Iterator[Tuple[str, int, int]]:
+    """Yield (raw, start, end) for every balanced JSON array/object in `text`.
+
+    Scans brackets while skipping string literals so a brace inside a tool
+    argument can't end the span early. Used when the model dropped the fence.
+    """
+    for opener in _JSON_START_RE.finditer(text):
+        start = opener.start()
+        close = "]" if text[start] == "[" else "}"
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            char = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth == 0:
+                    if char == close:
+                        yield text[start : i + 1], start, i + 1
+                    break
 
 
 def parse_tool_calls(
@@ -95,29 +214,28 @@ def parse_tool_calls(
     if not text:
         return None, text
 
-    candidates = []
-    cleaned = text
-    match = _FENCE_RE.search(text)
-    if match:
-        candidates.append(match.group(1))
-        cleaned = (text[: match.start()] + text[match.end() :]).strip()
-    else:
-        stripped = text.strip()
-        if stripped[:1] in ("[", "{"):
-            candidates.append(stripped)
+    # (raw JSON, span to cut from the reply if this is the one that parses).
+    # Every fenced block is tried, not just the first: a model that narrates
+    # before complying leaves a prose fence ahead of the real one.
+    candidates: List[Tuple[str, int, int]] = [
+        (match.group(1), match.start(), match.end())
+        for match in _FENCE_RE.finditer(text)
+    ]
+    # Unfenced fallback: any balanced JSON value in the reply.
+    candidates.extend(_iter_json_spans(text))
 
     allowed = set(valid_names)
-    for raw in candidates:
+    for raw, start, end in candidates:
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             continue
         calls = []
         for call in _coerce_calls(parsed):
-            name = call.get("name")
+            name = call.get("name") or (call.get("function") or {}).get("name")
             if not name or (allowed and name not in allowed):
                 continue
-            args = call.get("arguments", {})
+            args = _call_arguments(call)
             if isinstance(args, str):
                 # Some models already stringify arguments — keep as-is if it
                 # parses, else wrap.
@@ -136,6 +254,6 @@ def parse_tool_calls(
                 }
             )
         if calls:
-            return calls, cleaned
+            return calls, (text[:start] + text[end:]).strip()
 
     return None, text

@@ -38,7 +38,7 @@ from .admin.views import (
 from .config import settings
 from .db import engine, ensure_schema
 from .google_auth import startup_auto_import, sync_profile_to_db
-from .pool import close_all, pooled_profiles
+from .pool import close_all, pooled_profiles, profile_health
 from . import copilot_pool
 from .routes import (
     chat,
@@ -150,7 +150,14 @@ app.include_router(copilot_api.router)
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "active_profiles": pooled_profiles()}
+    # `profiles` carries each pooled profile's last success/failure so an
+    # upstream 502 can be attributed without opening the server's logs: reaching
+    # this endpoint at all rules out the host and the tunnel.
+    return {
+        "status": "ok",
+        "active_profiles": pooled_profiles(),
+        "profiles": profile_health,
+    }
 
 
 admin = Admin(

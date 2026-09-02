@@ -122,6 +122,33 @@ class Settings(BaseSettings):
     # Function calling for Gemini is prompt-EMULATED (the web backend has no
     # native tool API). False -> ignore `tools` and answer as plain chat.
     tool_emulation: bool = True
+    # A tool turn can't stream real deltas (parsing needs the whole reply before
+    # we know whether it's content or tool_calls), so the connection is held open
+    # while the model works. Emit a keepalive every N seconds so no proxy or
+    # router reads the silence as a dead socket — this is what turned agentic
+    # turns into "502 fetch connect timeout" at 9Router.
+    sse_keepalive_interval: float = 10.0
+    # Keepalives are SSE comment lines (": keepalive"), which the spec says
+    # parsers ignore, so they can't pollute content or the derived usage. Set
+    # false to send empty-delta chunks instead, for a router that mishandles them.
+    sse_keepalive_comment: bool = True
+    # Retry once when Google silently aborts a generation (gemini_webapi raises
+    # APIError "silently aborted"/"Unknown API error code" or GeminiError
+    # "connection ... was lost"). These are one-off upstream aborts, not account
+    # failures.
+    gemini_retry_transient: bool = True
+    # Hard ceiling for one Gemini turn including the retry — keeps a wedged call
+    # from outliving the caller's own timeout in silence.
+    gemini_turn_timeout: float = 300.0
+    # Passed to GeminiClient.init(). The library applies `timeout` while the model
+    # is thinking or queueing and `watchdog_timeout` only to a genuinely idle
+    # socket, so a short watchdog shortens zombie detection (its 120s default plus
+    # a 120s recovery poll = 240s of silence) without cutting slow answers short.
+    gemini_timeout: float = 240.0
+    gemini_watchdog_timeout: float = 45.0
+    # When the model ignores the tool_calls contract and answers with a stub,
+    # re-ask once with a contract-only nudge before giving up.
+    tool_repair_retry: bool = True
 
     # Ephemeral chat by default: a stateless chat (no conversation_id) runs as a
     # TEMPORARY session that isn't saved to the provider's web history. Gemini

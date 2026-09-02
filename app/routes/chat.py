@@ -10,6 +10,7 @@ starts a server-side thread, an existing id continues it (only the last user
 message is sent); the response carries `conversation_id` back.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -18,6 +19,7 @@ import os
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -28,6 +30,8 @@ from gemini_webapi import (
     TemporarilyBlockedError,
     UsageLimitExceededError,
 )
+from gemini_webapi.exceptions import APIError as GeminiAPIError
+from gemini_webapi.exceptions import GeminiError
 from gemini_webapi import GeneratedImage
 from gemini_webapi import TimeoutError as GeminiTimeoutError
 from notebooklm import NotebookNotFoundError
@@ -37,7 +41,13 @@ from ..comfy import fetch_image_bytes
 from ..config import settings
 from ..db import SessionLocal
 from ..models import GeminiConversation, utcnow
-from ..pool import get_gemini_client, get_notebook_client, notebook_locks
+from ..pool import (
+    get_gemini_client,
+    get_notebook_client,
+    notebook_locks,
+    record_failure,
+    record_success,
+)
 from ..schemas import (
     ChatCompletionRequest,
     build_chat_response,
@@ -50,6 +60,7 @@ from ..schemas import (
 )
 from ..security import AuthContext, describe_error, log_request, require_google_auth
 from ..tools import (
+    build_repair_instruction,
     build_tool_instruction,
     parse_tool_calls,
     tool_names,
@@ -110,14 +121,19 @@ async def gemini_chat_dispatch(
     tool-calling + streaming behavior.
     """
     if tools_requested(request.tools, request.tool_choice) and settings.tool_emulation:
-        cleaned, conv_id, tool_calls = await _gemini_chat_tools(
-            request, ctx, model, prompt
-        )
         if request.stream:
-            return _tool_stream_response(model, prompt, cleaned, tool_calls, conv_id)
+            # Set the turn up here (auth / bad conversation id stay clean HTTP
+            # errors) but run the model INSIDE the stream body, so response
+            # headers reach the caller immediately instead of after the whole
+            # generation. A buffered tool turn is what routers were reading as a
+            # dead socket.
+            turn = await _setup_tool_turn(request, ctx, model, prompt)
+            return _tool_stream_response(request, ctx, model, prompt, turn)
+        turn = await _setup_tool_turn(request, ctx, model, prompt)
+        cleaned, tool_calls = await _run_tool_turn(request, ctx, model, turn)
         payload = build_chat_response(model, prompt, cleaned, tool_calls=tool_calls)
-        if conv_id:
-            payload["conversation_id"] = conv_id
+        if turn.conv_id:
+            payload["conversation_id"] = turn.conv_id
         return payload
 
     # Real token streaming for Gemini (low TTFT) — what OpenAI routers expect.
@@ -203,6 +219,24 @@ def _map_gemini_exception(exc: Exception, model: str, profile: str) -> HTTPExcep
             f"Gemini request timed out: {str(exc) or 'no response in time'}",
             "api_error",
             "timeout",
+        )
+    if _is_transient_upstream(exc):
+        # 503, not 502: Google aborted this generation, the account is fine. A
+        # router that reads 502 as "account dead" would otherwise blacklist a
+        # healthy account and rotate to the next one for no reason.
+        logger.warning(
+            "Gemini aborted the generation (profile=%s, model=%s): %s",
+            profile,
+            model,
+            exc,
+        )
+        return openai_error(
+            503,
+            f"Gemini aborted the generation upstream: "
+            f"{str(exc) or type(exc).__name__}. This is a transient Google "
+            f"failure — retry the request.",
+            "api_error",
+            "upstream_aborted",
         )
     logger.exception("Gemini request failed (profile=%s, model=%s)", profile, model)
     return openai_error(
@@ -441,13 +475,28 @@ async def _gemini_chat(
         raise _map_gemini_exception(exc, model, ctx.profile_name)
 
 
-async def _gemini_chat_tools(
-    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
-) -> Tuple[str, Optional[str], Optional[List[dict]]]:
-    """Prompt-emulated function calling: inject tool schemas, run non-stream
-    (parsing needs the full text), parse the reply into OpenAI tool_calls.
+@dataclass
+class _ToolTurn:
+    """Everything a tool turn needs, resolved before the response commits."""
 
-    Returns (text, conv_id, tool_calls_or_None).
+    client: object
+    session: object
+    send_text: str
+    conv_id: Optional[str]
+    is_new: bool
+    title: Optional[str]
+    files: List[Path]
+    model_kwargs: dict
+
+
+async def _setup_tool_turn(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, prompt: str
+) -> _ToolTurn:
+    """Resolve the client, session and input files for a tool turn.
+
+    Kept separate from the model call so auth failures and unknown conversation
+    ids surface as real HTTP errors — once the streaming body starts, a 200 is
+    already on the wire and nothing can change that.
     """
     model_kwargs = {"model": model} if model.startswith("gemini-") else {}
     conv_id_in = (request.conversation_id or "").strip() or None
@@ -457,35 +506,150 @@ async def _gemini_chat_tools(
         session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
             ctx, client, model_kwargs, request, prompt, conv_id_in
         )
-        # Prepend the tool protocol to whatever gets sent (flattened prompt for
-        # stateless, the last user message for a conversation).
-        send_text = instruction + "\n\n" + send_text
+        # The protocol block goes AFTER the conversation: an agentic client sends
+        # tens of KB of history, and a contract stated before all of it is far
+        # from the point where the model actually decides what to emit.
+        send_text = send_text + "\n\n" + instruction
         files = await _prepare_vision_files(request)
-        logger.info(
-            "chat -> Gemini tools (profile=%s, model=%s, tools=%d)",
-            ctx.profile_name,
-            model,
-            len(request.tools or []),
-        )
-        try:
-            if session is None:
-                result = await client.generate_content(
-                    send_text,
-                    files=files or None,
-                    temporary=settings.chat_temporary,
-                    **model_kwargs,
-                )
-            else:
-                result = await session.send_message(send_text, files=files or None)
-        finally:
-            _cleanup_files(files)
-        text = extract_text(result)
-        if conv_id:
-            await _persist_conversation(is_new, conv_id, ctx, model, session, title)
-        calls, cleaned = parse_tool_calls(text, tool_names(request.tools))
-        return cleaned, conv_id, calls
     except Exception as exc:
         raise _map_gemini_exception(exc, model, ctx.profile_name)
+    return _ToolTurn(
+        client=client,
+        session=session,
+        send_text=send_text,
+        conv_id=conv_id,
+        is_new=is_new,
+        title=title,
+        files=files,
+        model_kwargs=model_kwargs,
+    )
+
+
+def _is_transient_upstream(exc: Exception) -> bool:
+    """True for Google aborting a generation mid-flight (not an account fault).
+
+    gemini_webapi surfaces these as APIError("The original request may have been
+    silently aborted"), APIError("Unknown API error code: …") and
+    GeminiError("The connection to Gemini was lost …, and recovery timed out").
+    All three mean "send it again", not "this account is dead".
+    """
+    if not isinstance(exc, (GeminiAPIError, GeminiError)):
+        return False
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "silently aborted",
+            "unknown api error code",
+            "connection to gemini was lost",
+            "temporary google service issue",
+        )
+    )
+
+
+async def _ask_gemini(turn: _ToolTurn, send_text: str):
+    if turn.session is None:
+        return await turn.client.generate_content(
+            send_text,
+            files=turn.files or None,
+            temporary=settings.chat_temporary,
+            **turn.model_kwargs,
+        )
+    return await turn.session.send_message(send_text, files=turn.files or None)
+
+
+async def _run_tool_turn(
+    request: ChatCompletionRequest, ctx: AuthContext, model: str, turn: _ToolTurn
+) -> Tuple[str, Optional[List[dict]]]:
+    """Run the model and parse the reply into OpenAI tool_calls.
+
+    Parsing needs the whole reply before it can tell content from tool_calls, so
+    this turn is genuinely non-streaming; the caller keeps the socket warm.
+
+    Returns (text, tool_calls_or_None).
+    """
+    names = tool_names(request.tools)
+    logger.info(
+        "chat -> Gemini tools (profile=%s, model=%s, tools=%d, prompt=%d chars)",
+        ctx.profile_name,
+        model,
+        len(request.tools or []),
+        len(turn.send_text),
+    )
+    started = time.perf_counter()
+    try:
+        try:
+            result = await _ask_gemini(turn, turn.send_text)
+        except Exception as exc:
+            if not (settings.gemini_retry_transient and _is_transient_upstream(exc)):
+                raise
+            logger.warning(
+                "Gemini aborted the turn (model=%s, %.1fs) — retrying once: %s",
+                model,
+                time.perf_counter() - started,
+                exc,
+            )
+            result = await _ask_gemini(turn, turn.send_text)
+
+        text = extract_text(result)
+        calls, cleaned = parse_tool_calls(text, names)
+
+        # The model ignored the contract and answered with a stub (the "OUT 8"
+        # case). One terse re-ask is much cheaper than a failed agent turn.
+        if calls is None and settings.tool_repair_retry and _needs_repair(
+            request, text
+        ):
+            logger.info(
+                "No tool_calls in a %d-char reply — re-asking with the contract "
+                "only (model=%s)",
+                len(text),
+                model,
+            )
+            repair = await _ask_gemini(
+                turn,
+                build_repair_instruction(request.tools, request.tool_choice),
+            )
+            repair_text = extract_text(repair)
+            repair_calls, repair_cleaned = parse_tool_calls(repair_text, names)
+            if repair_calls:
+                calls, cleaned = repair_calls, repair_cleaned
+            elif len(repair_text.strip()) > len(text.strip()):
+                # No call either way, but the retry at least said something.
+                cleaned = repair_cleaned
+
+        if turn.conv_id:
+            await _persist_conversation(
+                turn.is_new, turn.conv_id, ctx, model, turn.session, turn.title
+            )
+        logger.info(
+            "tool turn done (model=%s): %.1fs, %d chars, %d tool call(s)",
+            model,
+            time.perf_counter() - started,
+            len(cleaned or ""),
+            len(calls or []),
+        )
+        record_success(ctx.profile_name, "gemini")
+        return cleaned, calls
+    except Exception as exc:
+        record_failure(ctx.profile_name, "gemini", describe_error(exc))
+        raise _map_gemini_exception(exc, model, ctx.profile_name)
+    finally:
+        _cleanup_files(turn.files)
+        turn.files = []
+
+
+# A reply this short that carries no tool call is a stub, not an answer — the
+# symptom that showed up downstream as 8 completion tokens.
+_STUB_REPLY_CHARS = 200
+
+
+def _needs_repair(request: ChatCompletionRequest, text: str) -> bool:
+    choice = request.tool_choice
+    if isinstance(choice, str) and choice.strip().lower() == "required":
+        return True
+    if isinstance(choice, dict):
+        return True
+    return len(text.strip()) < _STUB_REPLY_CHARS
 
 
 def _sse_line(
@@ -641,28 +805,89 @@ async def _gemini_stream_response(
     return StreamingResponse(body(), media_type="text/event-stream")
 
 
+def _keepalive(chunk_id: str, created: int, model: str, conv_id: Optional[str]) -> str:
+    """One heartbeat frame for a turn that has nothing to say yet.
+
+    An SSE comment is the right tool — the spec has parsers ignore it, so it
+    cannot land in content or skew the usage a router derives from the stream.
+    The empty-delta form is the fallback for a router that mishandles comments.
+    """
+    if settings.sse_keepalive_comment:
+        return ": keepalive\n\n"
+    return _sse_line(chunk_id, created, model, {"content": ""}, conversation_id=conv_id)
+
+
 def _tool_stream_response(
+    request: ChatCompletionRequest,
+    ctx: AuthContext,
     model: str,
     prompt: str,
-    cleaned: str,
-    tool_calls: Optional[List[dict]],
-    conv_id: Optional[str],
+    turn: _ToolTurn,
 ) -> StreamingResponse:
-    """Synthetic SSE for the stream + tools case.
+    """SSE for the stream + tools case, with the model call inside the body.
 
-    Tool-call parsing needs the full text, so the model call already ran
-    non-stream; here we replay the result as a valid OpenAI stream (role →
-    tool_calls OR content → finish + usage → [DONE]).
+    Tool-call parsing needs the full reply before it can choose content vs
+    tool_calls, so this cannot stream real deltas. What it can do — and what the
+    old version failed to do — is commit the response headers immediately and
+    keep sending bytes while the model works, so nothing between here and the
+    client mistakes a slow turn for a dead connection.
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    conv_id = turn.conv_id
 
-    def body():
+    async def body():
+        # Headers flush on the first yield — before the model is even asked.
         yield _sse_line(
             chunk_id, created, model, {"role": "assistant", "content": None},
             conversation_id=conv_id,
         )
-        if tool_calls:
+
+        cleaned: str = ""
+        tool_calls: Optional[List[dict]] = None
+        error: Optional[str] = None
+
+        task = asyncio.create_task(
+            asyncio.wait_for(
+                _run_tool_turn(request, ctx, model, turn),
+                settings.gemini_turn_timeout,
+            )
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {task}, timeout=settings.sse_keepalive_interval
+                )
+                if done:
+                    break
+                yield _keepalive(chunk_id, created, model, conv_id)
+            cleaned, tool_calls = await task
+        except asyncio.TimeoutError:
+            error = (
+                f"Gemini did not finish within "
+                f"{settings.gemini_turn_timeout:.0f}s."
+            )
+            logger.warning("Tool turn timed out (model=%s)", model)
+        except Exception as exc:
+            # The 200 is already committed, so an HTTP error is no longer
+            # possible — report it as content and close the stream cleanly.
+            mapped = _map_gemini_exception(exc, model, ctx.profile_name)
+            error = (
+                mapped.detail.get("error", {}).get("message", str(exc))
+                if isinstance(mapped.detail, dict)
+                else str(exc)
+            )
+            logger.warning("Tool stream error (model=%s): %s", model, error)
+        finally:
+            _cleanup_files(turn.files)
+
+        if error:
+            yield _sse_line(
+                chunk_id, created, model, {"content": f"[error] {error}"},
+                conversation_id=conv_id,
+            )
+            finish, usage = "stop", _estimate_usage(prompt, error)
+        elif tool_calls:
             delta_calls = [
                 {
                     "index": i,
@@ -689,6 +914,7 @@ def _tool_stream_response(
                 )
             finish = "stop"
             usage = _estimate_usage(prompt, cleaned)
+
         yield _sse_line(chunk_id, created, model, {}, finish_reason=finish,
                         conversation_id=conv_id, usage=usage)
         if settings.sse_include_done:

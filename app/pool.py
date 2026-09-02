@@ -39,6 +39,31 @@ notebook_clients: Dict[str, NotebookLMClient] = {}
 gemini_clients: Dict[str, GeminiClient] = {}
 notebook_locks: Dict[str, asyncio.Lock] = {}
 
+# Last outcome per profile, surfaced by /healthz. Enough to tell "the host is
+# unreachable" from "the host is up and Google is refusing this account" without
+# reading the server's logs.
+profile_health: Dict[str, dict] = {}
+
+
+def record_success(profile_name: str, backend: str) -> None:
+    entry = profile_health.setdefault(profile_name, {})
+    entry["last_success_at"] = _now_iso()
+    entry["last_backend"] = backend
+    entry["last_error"] = None
+
+
+def record_failure(profile_name: str, backend: str, error: str) -> None:
+    entry = profile_health.setdefault(profile_name, {})
+    entry["last_error_at"] = _now_iso()
+    entry["last_backend"] = backend
+    entry["last_error"] = error[:300]
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 # Guards pool mutation so two concurrent first-requests for the same profile
 # don't both run the (expensive) initialization.
 _init_lock = asyncio.Lock()
@@ -160,7 +185,18 @@ async def _init_gemini(profile_name: str) -> GeminiClient:
         # auto_refresh=False: notebooklm-py's keepalive already rotates this
         # Google session's cookies (into the storage file -> DB). A second
         # rotator here would invalidate each other's PSIDTS in a loop.
-        await gemini_client.init(auto_refresh=False)
+        #
+        # The timeouts are ours, not the library's defaults (450/120). The
+        # watchdog only governs a genuinely idle socket — a thinking or queueing
+        # model gets the full `timeout` — so a short one just means a zombie
+        # stream is declared dead sooner. With the defaults, a stream Google had
+        # silently abandoned burned 120s of watchdog plus a 120s recovery poll
+        # before raising: four minutes of a caller staring at nothing.
+        await gemini_client.init(
+            auto_refresh=False,
+            timeout=settings.gemini_timeout,
+            watchdog_timeout=settings.gemini_watchdog_timeout,
+        )
     except AuthError as exc:
         raise _AuthExpired() from exc
     except Exception as exc:
