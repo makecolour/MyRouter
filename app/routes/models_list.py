@@ -23,6 +23,15 @@ router = APIRouter()
 
 
 def _static_gemini_models() -> List[str]:
+    """Hardcoded fallback for when the account registry comes back empty.
+
+    NOTE: gemini_webapi marks `constants.Model` "deprecated, pending removal" —
+    model identity is discovered per account at init() now, so these members go
+    stale whenever Google renames or retiers a model. Merely iterating the enum
+    is warning-free (the lib only warns when a member is passed to
+    generate_content), but this fallback should go away once the live registry
+    in gemini_model_entries() is trusted to always populate.
+    """
     names = []
     for member in GeminiModel:
         name = getattr(member, "model_name", None)

@@ -11,7 +11,6 @@ message is sent); the response carries `conversation_id` back.
 """
 
 import base64
-import copy
 import json
 import logging
 import mimetypes
@@ -25,13 +24,12 @@ from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from gemini_webapi import (
-    ModelInvalid,
-    TemporarilyBlocked,
-    UsageLimitExceeded,
+    ModelInvalidError,
+    TemporarilyBlockedError,
+    UsageLimitExceededError,
 )
 from gemini_webapi import GeneratedImage
 from gemini_webapi import TimeoutError as GeminiTimeoutError
-from gemini_webapi.constants import DEFAULT_METADATA as GEMINI_DEFAULT_METADATA
 from notebooklm import NotebookNotFoundError
 from sqlalchemy import select
 
@@ -150,24 +148,18 @@ def _chat_response(
     return payload
 
 
-# Pristine snapshot of the lib's default metadata, taken at import time —
-# before any chat could mutate the shared module-level list (see
-# _fresh_session below). No hardcoded shape: it tracks the installed lib.
-_FRESH_METADATA = copy.deepcopy(GEMINI_DEFAULT_METADATA)
-
-
 def _fresh_session(client, model_kwargs: dict, metadata=None):
-    """start_chat() with a PRIVATE metadata list.
+    """start_chat() carrying only this conversation's metadata.
 
-    gemini_webapi 2.0 bug: every ChatSession is initialized with the shared
-    module-level DEFAULT_METADATA list and the cid/rid/rcid setters mutate it
-    in place — so the first conversation's cid leaks into every later "new"
-    session (and even stateless calls), silently threading everything into
-    ONE Gemini conversation. Replacing the slot with a private copy isolates
-    each session properly.
+    Until gemini_webapi 2.1.0 every ChatSession shared the module-level
+    DEFAULT_METADATA list and the cid/rid/rcid setters mutated it in place, so
+    the first conversation's cid leaked into every later "new" session and
+    threaded everything into ONE Gemini conversation. We patched the private
+    slot to work around it. 2.1.0 fixed it upstream (ChatSession.__init__ now
+    does ``DEFAULT_METADATA.copy()``), so plain start_chat() is safe again —
+    hence the ==2.1.1 pin in requirements.txt.
     """
     session = client.start_chat(**model_kwargs)
-    session._ChatSession__metadata = list(_FRESH_METADATA)
     if metadata:
         session.metadata = metadata
     return session
@@ -177,7 +169,7 @@ def _map_gemini_exception(exc: Exception, model: str, profile: str) -> HTTPExcep
     """Translate a gemini_webapi exception into an OpenAI-shaped HTTPException."""
     if isinstance(exc, HTTPException):  # our own errors pass through
         return exc
-    if isinstance(exc, ModelInvalid):
+    if isinstance(exc, ModelInvalidError):
         return openai_error(
             404,
             f"Gemini model '{model}' is invalid or unavailable for this "
@@ -191,14 +183,14 @@ def _map_gemini_exception(exc: Exception, model: str, profile: str) -> HTTPExcep
             f"account. List valid models via GET /v1/models.",
             code="model_not_found",
         )
-    if isinstance(exc, UsageLimitExceeded):
+    if isinstance(exc, UsageLimitExceededError):
         return openai_error(
             429,
             f"Gemini usage limit exceeded for model '{model}': {exc}",
             "rate_limit_error",
             "rate_limit_exceeded",
         )
-    if isinstance(exc, TemporarilyBlocked):
+    if isinstance(exc, TemporarilyBlockedError):
         return openai_error(
             429,
             f"Google temporarily blocked this account's requests: {exc}",

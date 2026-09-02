@@ -16,6 +16,8 @@ from typing import Awaitable, Callable, Dict, List
 from fastapi import HTTPException
 from gemini_webapi import AuthError, GeminiClient
 from gemini_webapi.constants import AccountStatus
+from gemini_webapi.utils.rotate_1psidts import clear_cookies_cache
+from notebooklm import AuthError as NotebookAuthError
 from notebooklm import NotebookLMClient
 
 from .config import settings
@@ -79,6 +81,14 @@ async def _init_notebook(profile_name: str) -> NotebookLMClient:
             path=str(path), keepalive=settings.notebook_keepalive
         ).__aenter__()
     except Exception as exc:
+        # notebooklm-py signals a dead session two ways: AuthError (typed,
+        # 0.8.x error contract) and — once the client's own L1..L4 refresh
+        # ladder in _auth/session.py is exhausted — a bare ValueError whose
+        # message still reads "Authentication expired". Match both; either
+        # one means the stored cookies are past saving and only a re-login
+        # helps, which is what _AuthExpired triggers.
+        if isinstance(exc, NotebookAuthError):
+            raise _AuthExpired() from exc
         if isinstance(exc, ValueError) and "Authentication expired" in str(exc):
             raise _AuthExpired() from exc
         if isinstance(exc, HTTPException):
@@ -128,18 +138,11 @@ async def _init_gemini(profile_name: str) -> GeminiClient:
     # gemini_webapi tries its own cookie CACHE before the cookies we supply
     # (get_access_token phase 1) — a stale cached PSIDTS from earlier runs
     # then silently degrades the session. Drop the cache so our fresh jar is
-    # the first candidate; the path comes from the lib's own helper.
+    # the first candidate. clear_cookies_cache() is the lib's public helper
+    # (2.1.x); we used to reach into the private _get_cookies_cache_path.
     try:
-        from gemini_webapi.utils.rotate_1psidts import _get_cookies_cache_path
-
-        cache_path = _get_cookies_cache_path(gemini_client.cookies)
-        if cache_path and cache_path.is_file():
-            cache_path.unlink()
-            logger.info(
-                "Removed stale gemini cookie cache for '%s' (%s)",
-                profile_name,
-                cache_path.name,
-            )
+        clear_cookies_cache(gemini_client.cookies)
+        logger.info("Cleared stale gemini cookie cache for '%s'", profile_name)
     except Exception as exc:
         logger.warning("Could not clear gemini cookie cache: %s", exc)
 

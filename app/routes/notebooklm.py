@@ -20,9 +20,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends
 from fastapi.responses import FileResponse
 from notebooklm import (
+    ArtifactFeatureUnavailableError,
     ArtifactNotFoundError,
     NotebookNotFoundError,
     RateLimitError,
+    RPCError,
 )
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
@@ -159,12 +161,15 @@ async def _generate(request: NotebookLMGenerateRequest, ctx: AuthContext) -> dic
 
     kwargs = dict(request.options or {})
     if request.instructions:
-        # Different generators name their free-text parameter differently.
+        # Different generators name their free-text parameter differently, and
+        # notebooklm-py renames them between releases (0.8.x moved
+        # generate_study_guide from `instructions` to `extra_instructions`).
+        # Sniff the installed signature rather than hardcoding a per-type map.
         params = inspect.signature(method).parameters
-        if "instructions" in params:
-            kwargs.setdefault("instructions", request.instructions)
-        elif "custom_prompt" in params:
-            kwargs.setdefault("custom_prompt", request.instructions)
+        for candidate in ("instructions", "custom_prompt", "extra_instructions"):
+            if candidate in params:
+                kwargs.setdefault(candidate, request.instructions)
+                break
         else:
             logger.warning(
                 "Artifact type '%s' accepts no instructions; ignoring", artifact_type
@@ -188,6 +193,21 @@ async def _generate(request: NotebookLMGenerateRequest, ctx: AuthContext) -> dic
         )
     except TypeError as exc:
         raise openai_error(400, f"Invalid options for '{artifact_type}': {exc}")
+    except ArtifactFeatureUnavailableError as exc:
+        raise openai_error(
+            502,
+            f"NotebookLM does not offer '{artifact_type}' on this account: {exc}",
+            "api_error",
+            "feature_unavailable",
+        )
+    except RPCError as exc:
+        # Since 0.8.0 a synchronous refusal RAISES here; 0.7.x returned a
+        # GenerationStatus(status="failed") that fell through as a success.
+        raise openai_error(
+            502,
+            f"NotebookLM refused to generate '{artifact_type}': {exc}",
+            "api_error",
+        )
     except Exception as exc:
         logger.exception("Generation kickoff failed (%s)", artifact_type)
         raise openai_error(502, f"NotebookLM generation failed: {exc}", "api_error")

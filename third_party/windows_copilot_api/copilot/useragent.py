@@ -43,8 +43,10 @@ import platform
 
 logger = logging.getLogger("ai-sidecar.copilot-ua")
 
-# Fallback Chromium major if detection fails (upstream's pinned value).
-_FALLBACK_MAJOR = 148
+# Fallback Chromium major if detection fails. Tracks the Chromium that the
+# pinned Playwright bundles (1.62 -> 151), so a detection failure still lands
+# near the real browser instead of years behind it.
+_FALLBACK_MAJOR = 151
 
 
 def _installed_chromium_major() -> int:
@@ -105,7 +107,9 @@ CHROME_CLIENT_HINTS = {
 }
 
 # Pinned curl_cffi impersonation profile (TLS/HTTP2 fingerprint). The UA itself
-# is overridden on top, so the profile version need not equal _MAJOR.
-IMPERSONATE_TARGET = "chrome146"
+# is overridden on top, so the profile version need not equal _MAJOR — but the
+# closer the better. chrome150 is the newest target curl_cffi 0.16.2 ships;
+# re-check `curl_cffi.requests.impersonate` when bumping that pin.
+IMPERSONATE_TARGET = "chrome150"
 
 logger.info("Copilot UA resolved: %s (platform=%s)", CHROME_UA, _PLATFORM)

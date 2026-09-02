@@ -10,12 +10,21 @@ pydantic-settings>=2.2
 python-dotenv>=1.0
 sqladmin>=0.29
 itsdangerous>=2.1
-notebooklm-py
-gemini-webapi
+# Pinned exactly: both libraries are reverse-engineered clients that move fast
+# and break their own surface. See README "Pinned versions" before bumping.
+# ==0.8.1: 0.8.0 flipped the error contract ("absence and refusal raise") — the
+# auth-expiry branch in app/pool.py matches typed exceptions because of it.
+notebooklm-py==0.8.1
+# ==2.1.1: 2.1.0 fixed the shared-DEFAULT_METADATA ChatSession bug that
+# app/routes/chat.py used to patch around, and pins curl-cffi~=0.16.2.
+gemini-webapi==2.1.1
 # used by the gemini cookie warmup utility (login browsers come from notebooklm-py)
 # and by the vendored Copilot bridge (third_party/windows_copilot_api). Run
-# `playwright install chromium` once after installing.
-playwright>=1.40
+# `playwright install chromium` once after installing. >=1.62 bundles Chromium
+# 151, which third_party/.../useragent.py reads to build the Copilot UA.
+playwright>=1.62
 # vendored Windows-Copilot-API driver speaks the Copilot chat protocol over a
 # Cloudflare-impersonating curl_cffi session (also used by gemini-webapi).
-curl_cffi>=0.15
+# ~=0.16.2 is required by gemini-webapi 2.1.1; also the first release with
+# Python 3.14 wheels and a chrome150 impersonate target.
+curl_cffi~=0.16.2

@@ -64,7 +64,7 @@ Hết hạn giữa request → tự chạy LOGIN_COMMAND → retry ngay trong re
 
 Ba quy tắc quan trọng (đã trả giá để học được):
 1. **Mỗi profile = đúng một tài khoản Google** trong phiên browser (gemini_webapi không hỗ trợ `authuser`). Dùng checkbox **fresh** khi đổi tài khoản.
-2. **Chỉ một bên xoay cookie**: notebooklm-py keepalive. Gemini chạy `auto_refresh=False`, và cache cookie riêng của gemini_webapi bị xóa trước mỗi init (cache cũ làm phiên degraded → chat không hiện trong lịch sử Gemini web).
+2. **Chỉ một bên xoay cookie**: notebooklm-py keepalive. Gemini chạy `auto_refresh=False`, và cache cookie riêng của gemini_webapi bị xóa trước mỗi init bằng `clear_cookies_cache()` (cache cũ làm phiên degraded → chat không hiện trong lịch sử Gemini web).
 3. Không sửa tay `storage_state.json` — DB sẽ ghi đè/được ghi đè theo mtime.
 
 ---
@@ -80,6 +80,22 @@ Ba quy tắc quan trọng (đã trả giá để học được):
 | Gemini / NotebookLM | Tài khoản Google (đã dùng được Gemini + NotebookLM) + máy **có màn hình** để login (cửa sổ browser Edge/Chrome/Chromium). |
 | ComfyUI (ảnh) | Ít nhất một ComfyUI instance truy cập được qua HTTP(S). |
 | Copilot | `playwright install chromium` một lần + máy **có màn hình** để login; chat chạy qua headless browser. |
+
+### Phiên bản đã ghim (đọc trước khi nâng cấp)
+
+`notebooklm-py` và `gemini-webapi` là client reverse-engineered, đổi API surface
+rất nhanh, nên `requirements.txt` **ghim chính xác** thay vì `>=`:
+
+| Gói | Pin | Vì sao |
+|---|---|---|
+| `notebooklm-py` | `==0.8.1` | 0.8.0 đổi error contract ("absence and refusal raise") — `app/pool.py` bắt `AuthError` có kiểu vì việc này, và `generate_study_guide` đã đổi tham số free-text sang `extra_instructions`. |
+| `gemini-webapi` | `==2.1.1` | 2.1.0 sửa bug ChatSession dùng chung `DEFAULT_METADATA` (trước đây mọi hội thoại bị gộp làm một). 2.1.x cũng đổi tên `ModelInvalid`/`TemporarilyBlocked`/`UsageLimitExceeded` → hậu tố `*Error`. |
+| `curl_cffi` | `~=0.16.2` | Bắt buộc bởi gemini-webapi 2.1.1; cũng là bản đầu tiên có wheel Python 3.14 và target impersonate `chrome150`. |
+| `playwright` | `>=1.62` | Bundle Chromium 151. `third_party/.../useragent.py` đọc `browsers.json` của Playwright để dựng UA cho Copilot — nếu file/schema đó đổi chỗ, UA lặng lẽ rơi về fallback và Cloudflare clearance hỏng. |
+
+Khi bump: chạy lại `playwright install chromium`, và kiểm tra
+`IMPERSONATE_TARGET` trong `third_party/windows_copilot_api/copilot/useragent.py`
+vẫn là target chrome mới nhất mà curl_cffi hỗ trợ.
 
 ## 3. Cài đặt & Deploy
 
