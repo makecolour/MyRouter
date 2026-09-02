@@ -18,6 +18,16 @@ _FENCE_RE = re.compile(
 # Models that ignore the fence still tend to emit the JSON somewhere in the
 # reply, so a bracket scan is the last resort before giving up.
 _JSON_START_RE = re.compile(r"[\[{]")
+# qwen-code teaches its models a bracket notation rather than a fenced block:
+#     [tool_call: run_shell_command {"command": "df -h"}]
+# It opens with "[", so the unfenced scan below grabs it and json.loads chokes
+# on `tool_call:`. Unrecognised, the call leaks into the chat as prose and
+# nothing ever runs. Matching it here fixes every qwen client at once.
+_BRACKET_CALL_RE = re.compile(
+    r"\[\s*(?:tool_calls?|called\s+tools?|function_calls?)\s*:\s*"
+    r"([A-Za-z_][\w.-]*)\s*",
+    re.IGNORECASE,
+)
 # OpenAI says "arguments"; emulated models reach for whatever the schema called
 # it. All of these mean the same thing.
 _ARG_ALIASES = ("arguments", "args", "parameters", "input", "params")
@@ -169,38 +179,86 @@ def _call_arguments(call: dict) -> Any:
     return {}
 
 
+def _balanced_end(text: str, start: int) -> Optional[int]:
+    """Index just past the balanced JSON value opening at `start`, else None.
+
+    Skips string literals so a brace inside a tool argument can't end the span
+    early.
+    """
+    close = "]" if text[start] == "[" else "}"
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1 if char == close else None
+    return None
+
+
 def _iter_json_spans(text: str) -> Iterator[Tuple[str, int, int]]:
     """Yield (raw, start, end) for every balanced JSON array/object in `text`.
 
-    Scans brackets while skipping string literals so a brace inside a tool
-    argument can't end the span early. Used when the model dropped the fence.
+    Used when the model dropped the fence.
     """
     for opener in _JSON_START_RE.finditer(text):
         start = opener.start()
-        close = "]" if text[start] == "[" else "}"
-        depth = 0
-        in_string = False
-        escaped = False
-        for i in range(start, len(text)):
-            char = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-            elif char in "[{":
-                depth += 1
-            elif char in "]}":
-                depth -= 1
-                if depth == 0:
-                    if char == close:
-                        yield text[start : i + 1], start, i + 1
-                    break
+        end = _balanced_end(text, start)
+        if end is not None:
+            yield text[start:end], start, end
+
+
+def _iter_bracket_calls(text: str) -> Iterator[Tuple[str, int, int]]:
+    """Yield qwen's `[tool_call: name {...}]` rewritten as ordinary call JSON.
+
+    The rewrite is textual so the result flows through the same json.loads and
+    name allowlist as every other candidate — a malformed argument object just
+    fails to parse and the scan moves on.
+    """
+    for match in _BRACKET_CALL_RE.finditer(text):
+        args_at = match.end()
+        if args_at >= len(text) or text[args_at] != "{":
+            continue
+        args_end = _balanced_end(text, args_at)
+        if args_end is None:
+            continue
+        raw = '{"name": %s, "arguments": %s}' % (
+            json.dumps(match.group(1)),
+            text[args_at:args_end],
+        )
+        # Swallow the closing bracket too, so the notation leaves nothing behind
+        # in the chat.
+        tail = text[args_end:]
+        stripped = tail.lstrip()
+        end = args_end
+        if stripped.startswith("]"):
+            end += len(tail) - len(stripped) + 1
+        yield raw, match.start(), end
+
+
+def looks_like_a_mangled_call(text: str, valid_names: List[str]) -> bool:
+    """True when the reply reads like a tool call the parser could not read.
+
+    A tool name sitting next to JSON punctuation is evidence the model tried and
+    botched the contract. Anything else — however short — is an answer.
+    """
+    if not text or not _JSON_START_RE.search(text):
+        return False
+    return any(name and name in text for name in valid_names)
 
 
 def parse_tool_calls(
@@ -221,6 +279,9 @@ def parse_tool_calls(
         (match.group(1), match.start(), match.end())
         for match in _FENCE_RE.finditer(text)
     ]
+    # qwen's bracket notation, ahead of the generic scan: that scan sees the
+    # same "[" and would only fail to parse it.
+    candidates.extend(_iter_bracket_calls(text))
     # Unfenced fallback: any balanced JSON value in the reply.
     candidates.extend(_iter_json_spans(text))
 

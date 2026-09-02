@@ -62,6 +62,7 @@ from ..security import AuthContext, describe_error, log_request, require_google_
 from ..tools import (
     build_repair_instruction,
     build_tool_instruction,
+    looks_like_a_mangled_call,
     parse_tool_calls,
     tool_names,
     tools_requested,
@@ -594,14 +595,14 @@ async def _run_tool_turn(
         text = extract_text(result)
         calls, cleaned = parse_tool_calls(text, names)
 
-        # The model ignored the contract and answered with a stub (the "OUT 8"
+        # The model tried to call a tool and mangled the contract (the "OUT 8"
         # case). One terse re-ask is much cheaper than a failed agent turn.
         if calls is None and settings.tool_repair_retry and _needs_repair(
-            request, text
+            request, text, names
         ):
             logger.info(
-                "No tool_calls in a %d-char reply — re-asking with the contract "
-                "only (model=%s)",
+                "Unparseable tool call in a %d-char reply — re-asking with the "
+                "contract only (model=%s)",
                 len(text),
                 model,
             )
@@ -613,8 +614,12 @@ async def _run_tool_turn(
             repair_calls, repair_cleaned = parse_tool_calls(repair_text, names)
             if repair_calls:
                 calls, cleaned = repair_calls, repair_cleaned
-            elif len(repair_text.strip()) > len(text.strip()):
-                # No call either way, but the retry at least said something.
+            elif not cleaned.strip():
+                # No call either way. Keep the ORIGINAL unless it was empty: a
+                # model just told "no prose, nothing outside the fence" with
+                # nothing to call answers with a refusal, and preferring the
+                # longer text (as this once did) hands the user that refusal
+                # instead of the answer it already had.
                 cleaned = repair_cleaned
 
         if turn.conv_id:
@@ -638,18 +643,30 @@ async def _run_tool_turn(
         turn.files = []
 
 
-# A reply this short that carries no tool call is a stub, not an answer — the
-# symptom that showed up downstream as 8 completion tokens.
-_STUB_REPLY_CHARS = 200
+def _needs_repair(
+    request: ChatCompletionRequest, text: str, names: List[str]
+) -> bool:
+    """Whether a reply with no parsed call is a *failed* call worth re-asking.
 
+    This used to be `len(text) < 200`, on the theory that a short reply was the
+    stub behind the "OUT 8" case. It is not: an agentic client sends tools on
+    every request, so that test fired on most normal answers — "Disk usage is
+    41%.", "Done.", or a greeting — and the repair prompt ("no prose, nothing
+    outside the fence") turns each of them into a refusal. Observed: "alo?" came
+    back as "I cannot generate a tool-calling JSON block…" after a second 16s
+    round trip.
 
-def _needs_repair(request: ChatCompletionRequest, text: str) -> bool:
+    Brevity is not evidence. An empty reply is, and so is a tool name sitting
+    next to JSON punctuation.
+    """
     choice = request.tool_choice
     if isinstance(choice, str) and choice.strip().lower() == "required":
         return True
     if isinstance(choice, dict):
         return True
-    return len(text.strip()) < _STUB_REPLY_CHARS
+    if not text.strip():
+        return True
+    return looks_like_a_mangled_call(text, names)
 
 
 def _sse_line(
