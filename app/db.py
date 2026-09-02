@@ -43,6 +43,13 @@ _GEMINI_CONV_MIGRATIONS = {
 }
 
 
+# v4.2 headless auth: the durable master token + the account it is bound to.
+_GOOGLE_PROFILE_MIGRATIONS = {
+    "master_token": "ADD COLUMN master_token JSON NULL",
+    "account_email": "ADD COLUMN account_email VARCHAR(320) NULL",
+}
+
+
 async def _table_columns(conn, table: str) -> dict:
     rows = (
         await conn.execute(
@@ -83,3 +90,9 @@ async def ensure_schema() -> None:
                 await conn.execute(
                     text(f"ALTER TABLE gemini_conversations {ddl}")
                 )
+
+        existing = await _table_columns(conn, "google_profiles")
+        for column, ddl in _GOOGLE_PROFILE_MIGRATIONS.items():
+            if existing and column not in existing:
+                logger.info("Migrating google_profiles: %s", ddl)
+                await conn.execute(text(f"ALTER TABLE google_profiles {ddl}"))

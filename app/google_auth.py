@@ -21,10 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from notebooklm.auth import bootstrap_missing_storage_from_master_token
 from notebooklm.paths import (
     get_browser_profile_dir,
     get_storage_path,
     list_profiles,
+    master_token_path_for,
 )
 from sqlalchemy import select
 
@@ -62,6 +64,56 @@ def _storage_path(profile: str) -> Path:
         )
 
 
+def _master_token_path(profile: str) -> Path:
+    """master_token.json sibling of this profile's storage file.
+
+    Derived by the library, never by string-joining: master_token_path_for()
+    is notebooklm-py's SOLE derivation site for the sibling invariant (its
+    docstring records four call sites that disagreed on canonicalization
+    before it existed, silently breaking headless auth for symlinked or
+    relative --storage aliases).
+    """
+    return master_token_path_for(_storage_path(profile))
+
+
+def _write_master_token(profile: str, token: dict) -> Optional[Path]:
+    """DB -> file for the master token, at mode 0600.
+
+    The token mints Google session cookies on demand, so it is strictly more
+    sensitive than the cookies themselves — it is written owner-only, matching
+    how notebooklm-py's own writer stores it.
+    """
+    path = _master_token_path(profile)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(token), encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Windows ACLs don't map onto POSIX modes; the write still stands.
+            pass
+        return path
+    except OSError as exc:
+        logger.warning("Could not write master token for '%s': %s", profile, exc)
+        return None
+
+
+def _read_master_token(profile: str) -> Optional[dict]:
+    """File -> DB for the master token; None when absent or unreadable."""
+    path = _master_token_path(profile)
+    if not path.exists():
+        return None
+    try:
+        token = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read master token for '%s': %s", profile, exc)
+        return None
+    # Shape check mirrors notebooklm-py's own reader (_auth/master_token_file).
+    if not isinstance(token, dict) or not token.get("master_token"):
+        return None
+    return token
+
+
 async def get_profile_row(profile: str) -> Optional[GoogleProfile]:
     async with SessionLocal() as session:
         return (
@@ -77,6 +129,8 @@ async def upsert_profile(
     *,
     status: str = "active",
     touch_login: bool = False,
+    master_token: Optional[dict] = None,
+    account_email: Optional[str] = None,
 ) -> None:
     now = utcnow()
     async with SessionLocal() as session:
@@ -92,6 +146,12 @@ async def upsert_profile(
         row.state_sha256 = _digest(state)
         row.status = status
         row.last_synced_at = now
+        # Only ever ADD a token here — passing None means "unchanged", not
+        # "clear it". A cookie sync must never wipe a working master token.
+        if master_token is not None:
+            row.master_token = master_token
+        if account_email is not None:
+            row.account_email = account_email
         if touch_login:
             row.last_login_at = now
         await session.commit()
@@ -123,11 +183,23 @@ async def import_profile_from_file(profile: str, *, touch_login: bool = False) -
         return False
     if not state.get("cookies"):
         return False
-    await upsert_profile(profile, state, status="active", touch_login=touch_login)
+    # A --master-token login writes the durable token as a sibling; pick it up
+    # in the same pass so the DB holds everything a fresh host needs. Also
+    # covers a token bootstrapped outside the app (CLI) before startup scan.
+    token = _read_master_token(profile)
+    await upsert_profile(
+        profile,
+        state,
+        status="active",
+        touch_login=touch_login,
+        master_token=token,
+        account_email=(token or {}).get("email"),
+    )
     logger.info(
-        "Imported Google auth for profile '%s' into DB (%d cookies)",
+        "Imported Google auth for profile '%s' into DB (%d cookies%s)",
         profile,
         len(state["cookies"]),
+        ", + master token" if token else "",
     )
     return True
 
@@ -163,6 +235,19 @@ async def materialize_profile(profile: str) -> Path:
         )
     path = _storage_path(profile)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # The master token rides along with the cookies: headless re-auth is only
+    # possible on this host if the sibling file exists, and the DB is the
+    # source of truth for it exactly as it is for storage_state.
+    if row.master_token:
+        token_path = _master_token_path(profile)
+        if not token_path.exists():
+            if _write_master_token(profile, row.master_token):
+                logger.info(
+                    "Materialized master token for '%s' -> %s",
+                    profile,
+                    token_path.name,
+                )
 
     if path.exists():
         try:
@@ -206,10 +291,33 @@ async def sync_profile_to_db(profile: str) -> bool:
     if not state.get("cookies"):
         return False
     row = await get_profile_row(profile)
-    if row is not None and row.state_sha256 == _digest(state):
+    # A re-mint rewrites master_token.json without touching the cookie digest,
+    # so the token is compared independently of the early-out below.
+    token = _read_master_token(profile)
+    token_is_new = token is not None and (row is None or row.master_token != token)
+
+    if row is not None and row.state_sha256 == _digest(state) and not token_is_new:
         return False
-    await upsert_profile(profile, state, status="active")
-    logger.info("Synced rotated cookies for '%s' back to DB", profile)
+    await upsert_profile(
+        profile,
+        state,
+        status="active",
+        master_token=token if token_is_new else None,
+        account_email=(token or {}).get("email") if token_is_new else None,
+    )
+    cookies_changed = row is None or row.state_sha256 != _digest(state)
+    logger.info(
+        "Synced %s for '%s' back to DB",
+        " + ".join(
+            part
+            for part, changed in (
+                ("rotated cookies", cookies_changed),
+                ("master token", token_is_new),
+            )
+            if changed
+        ),
+        profile,
+    )
     return True
 
 
@@ -245,7 +353,11 @@ def login_in_progress(profile: Optional[str] = None) -> bool:
 
 
 def _build_login_invocation(
-    profile: str, path: Path, fresh: bool = False
+    profile: str,
+    path: Path,
+    fresh: bool = False,
+    *,
+    master_token_email: Optional[str] = None,
 ) -> Tuple[list, dict]:
     """Build the interactive-login subprocess command and environment.
 
@@ -269,6 +381,15 @@ def _build_login_invocation(
         # Clears the profile's cached browser session first — used to switch
         # the Google account bound to a profile (dashboard checkbox).
         command.append("--fresh")
+    if master_token_email:
+        # One browser sign-in bootstraps a DURABLE token; afterwards cookies
+        # are minted headlessly forever. --account is mandatory with
+        # --master-token (the CLI rejects it otherwise).
+        #
+        # --force is deliberately NOT passed: it would overwrite a token
+        # belonging to a DIFFERENT Google account, so a mistyped address
+        # would silently rebind the profile. Let the CLI refuse instead.
+        command += ["--master-token", "--account", master_token_email]
     env = {**os.environ, "NOTEBOOKLM_PROFILE": profile}
     return command, env
 
@@ -283,13 +404,22 @@ async def _status_after_failed_login(
         await set_profile_status(profile, "error")
 
 
-async def run_interactive_login(profile: str, fresh: bool = False) -> bool:
+async def run_interactive_login(
+    profile: str,
+    fresh: bool = False,
+    *,
+    master_token_email: Optional[str] = None,
+) -> bool:
     """Run the notebooklm-py interactive login targeted at this profile.
 
     Targeting works via NOTEBOOKLM_PROFILE env + `--storage PATH` (the CLI's
     `--profile-name` flag is only valid together with `--browser-cookies`).
     Opens a browser window on this host (the server runs on the user's own
     machine). Returns True when the login finished and was saved to the DB.
+
+    With `master_token_email`, the same one browser sign-in ALSO bootstraps a
+    durable master token, after which this profile never needs a browser
+    again — see attempt_headless_reauth.
     """
     path = _storage_path(profile)
     if _login_lock.locked():
@@ -306,7 +436,9 @@ async def run_interactive_login(profile: str, fresh: bool = False) -> bool:
         await set_profile_status(profile, "pending_login")
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        command, env = _build_login_invocation(profile, path, fresh)
+        command, env = _build_login_invocation(
+            profile, path, fresh, master_token_email=master_token_email
+        )
         logger.info(
             "Starting interactive login for profile '%s': %s (NOTEBOOKLM_PROFILE=%s)",
             profile,
@@ -450,6 +582,47 @@ async def _profile_is_fresh(profile: str) -> bool:
         and row.status == "active"
         and (row.storage_state or {}).get("cookies")
     )
+
+
+async def attempt_headless_reauth(profile: str) -> bool:
+    """Mint fresh Google cookies from the stored master token — no browser.
+
+    This is the whole point of the master-token bootstrap: on a host with no
+    display (or a server nobody is sitting at), a lapsed session heals itself
+    instead of blocking on a browser window that will never be answered.
+
+    Returns True when a fresh storage file landed and was synced to the DB.
+    Returns False when the profile has no token, or the re-mint failed — the
+    caller then falls back to the interactive browser login.
+    """
+    row = await get_profile_row(profile)
+    if row is None or not row.master_token:
+        return False
+
+    path = _storage_path(profile)
+    # The token must be on disk for the library to find it — on a fresh host
+    # the DB is the only copy, and storage_state.json may not exist at all
+    # (which is precisely the case this bootstrap handles).
+    if not _master_token_path(profile).exists():
+        if not _write_master_token(profile, row.master_token):
+            return False
+
+    logger.info("Attempting headless re-auth for '%s' from master token", profile)
+    try:
+        ok = await bootstrap_missing_storage_from_master_token(path)
+    except Exception as exc:
+        logger.warning("Headless re-auth for '%s' failed: %s", profile, exc)
+        return False
+    if not ok:
+        logger.info("Headless re-auth for '%s' produced no new cookies", profile)
+        return False
+
+    # Fresh cookies are on disk — the DB is the source of truth, so push them
+    # back before anyone re-materializes and overwrites them with the old jar.
+    await sync_profile_to_db(profile)
+    await set_profile_status(profile, "active")
+    logger.info("Headless re-auth succeeded for '%s' (no browser opened)", profile)
+    return True
 
 
 async def attempt_auto_relogin(profile: str) -> bool:

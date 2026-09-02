@@ -58,6 +58,15 @@ class GoogleProfile(Base):
     profile_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     storage_state: Mapped[Any] = mapped_column(JSON, nullable=False, default=dict)
     state_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Durable Google master token ({master_token, email, android_id}) that
+    # notebooklm-py mints fresh cookies from WITHOUT a browser. Kept in the DB
+    # like storage_state so a fresh host can reconstitute headless auth from
+    # MySQL alone; materialized to master_token.json (0600) beside the storage
+    # file. NULL for profiles that have not been bootstrapped.
+    master_token: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    # Google account the master token is bound to — `login --master-token`
+    # requires --account EMAIL, so storing it means re-mints never re-prompt.
+    account_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
     # active | expired | pending_login | error
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

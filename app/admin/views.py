@@ -72,6 +72,18 @@ async def _login_and_reload(profile: str, fresh: bool = False) -> None:
         logger.exception("Background login for '%s' failed", profile)
 
 
+async def _bootstrap_token_and_reload(profile: str, email: str) -> None:
+    """One browser sign-in that also mints the durable master token."""
+    try:
+        ok = await run_interactive_login(profile, master_token_email=email)
+        last_login_results[profile] = (ok, utcnow())
+        if ok:
+            await invalidate_profile(profile)
+    except Exception:
+        last_login_results[profile] = (False, utcnow())
+        logger.exception("Master-token bootstrap for '%s' failed", profile)
+
+
 async def _copilot_login_and_reload(profile: str) -> None:
     try:
         ok = await copilot_auth.run_copilot_login(profile)
@@ -222,12 +234,16 @@ class GoogleProfileAdmin(ModelView, model=GoogleProfile):
     column_list = [
         GoogleProfile.profile_name,
         GoogleProfile.status,
+        GoogleProfile.account_email,
         GoogleProfile.last_login_at,
         GoogleProfile.last_synced_at,
     ]
     column_details_exclude_list = [
         GoogleProfile.storage_state,
         GoogleProfile.state_sha256,
+        # The master token mints session cookies on demand — strictly more
+        # sensitive than the cookies themselves, so it never renders.
+        GoogleProfile.master_token,
     ]
     form_columns = [GoogleProfile.status]
     can_create = False  # profiles are created by the login flow on the Status page
@@ -357,6 +373,9 @@ class StatusView(BaseView):
                     "logging_in": login_in_progress(p.profile_name),
                     "last_login_at": _fmt_local(p.last_login_at),
                     "last_synced_at": _fmt_local(p.last_synced_at),
+                    # Bool only — the token itself never reaches a template.
+                    "headless": bool(p.master_token),
+                    "account_email": p.account_email or "",
                 }
                 for p in profiles
             ],
@@ -422,6 +441,26 @@ class StatusView(BaseView):
             _spawn(_login_and_reload(profile, fresh=fresh))
             logger.info(
                 "Dashboard triggered login for '%s' (fresh=%s)", profile, fresh
+            )
+        return RedirectResponse(url="/admin/status", status_code=303)
+
+    @expose("/status/bootstrap-token", methods=["POST"])
+    async def action_bootstrap_token(self, request: Request):
+        """Bootstrap headless auth: one browser sign-in, then no browser ever.
+
+        Requires the account email — notebooklm-py's --master-token refuses to
+        run without --account, because the token it mints is bound to exactly
+        one Google account.
+        """
+        form = await request.form()
+        profile = str(form.get("profile", "")).strip()
+        email = str(form.get("email", "")).strip()
+        if profile and email and not login_in_progress():
+            _spawn(_bootstrap_token_and_reload(profile, email))
+            logger.info(
+                "Dashboard triggered master-token bootstrap for '%s' (%s)",
+                profile,
+                email,
             )
         return RedirectResponse(url="/admin/status", status_code=303)
 

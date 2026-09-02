@@ -36,7 +36,9 @@ app/
 │   ├── copilot_api.py # /copilot/v1/* (models, chat, conversations)
 │   ├── gemini_api.py notebooklm_api.py comfy_api.py  # 3 provider surface cho 9Router
 │   ├── models_list.py # /v1/models
-│   └── notebooklm.py  # /v1/notebooklm/* (generate, artifacts, status, download)
+│   ├── notebooklm.py  # /v1/notebooklm/* (generate, artifacts, status, download, rename/delete/prompt)
+│   ├── collections.py # /v1/notebooklm/collections/* (0.8.1)
+│   └── research.py    # /v1/notebooklm/{nb}/research/* (deep research, 0.8.x)
 ├── admin/             # Dashboard SQLAdmin (/admin) + API Playground
 scripts/copilot_login.py            # Đăng nhập Copilot (Playwright) vào session dir mỗi account
 third_party/windows_copilot_api/    # thư viện Copilot vendored (MIT) — có sửa cục bộ (xem header useragent.py)
@@ -77,9 +79,42 @@ Ba quy tắc quan trọng (đã trả giá để học được):
 
 | Backend | Cần thêm |
 |---|---|
-| Gemini / NotebookLM | Tài khoản Google (đã dùng được Gemini + NotebookLM) + máy **có màn hình** để login (cửa sổ browser Edge/Chrome/Chromium). |
+| Gemini / NotebookLM | Tài khoản Google (đã dùng được Gemini + NotebookLM) + máy **có màn hình** để login **một lần** (cửa sổ browser Edge/Chrome/Chromium). Sau khi bootstrap master token (xem dưới), re-auth **không cần browser** → chạy được trên VPS headless. |
 | ComfyUI (ảnh) | Ít nhất một ComfyUI instance truy cập được qua HTTP(S). |
-| Copilot | `playwright install chromium` một lần + máy **có màn hình** để login; chat chạy qua headless browser. |
+| Copilot | `playwright install chromium` một lần + máy **có màn hình** để login; chat chạy qua headless browser. **Ràng buộc này KHÔNG đổi** — `cf_clearance` (~30 phút) vẫn cần browser thật, đó là giới hạn của thư viện vendored. |
+
+### Auth headless cho Google (master token)
+
+Mặc định, khi cookie Google hết hạn giữa request, MyRouter chạy lại lệnh login
+→ **mở một cửa sổ browser** trên máy chủ. Trên VPS không màn hình thì việc đó
+không bao giờ hoàn tất.
+
+`notebooklm-py` 0.8.x giải quyết bằng **master token**: đăng nhập browser **đúng
+một lần**, sau đó cookie được mint lại **hoàn toàn không cần browser**.
+
+Bootstrap (chọn một trong hai):
+
+```powershell
+# A. Từ dashboard: /admin/status → nút "Bootstrap headless" (nhập email tài khoản)
+
+# B. Từ terminal:
+$env:NOTEBOOKLM_PROFILE = "default"
+notebooklm login --storage <đường dẫn storage_state.json> `
+                 --master-token --account you@gmail.com
+```
+
+Sau đó:
+
+- `master_token.json` (chmod 0600) nằm cạnh `storage_state.json`, **và** được
+  lưu vào cột `google_profiles.master_token` — DB vẫn là nguồn chân lý, nên một
+  máy mới chỉ cần MySQL là dựng lại được auth headless.
+- Cột `Headless` trên trang Status hiện `yes` cho profile đã bootstrap.
+- Khi auth hết hạn: thử `attempt_headless_reauth` trước (im lặng, không browser);
+  chỉ khi thất bại mới rơi về login tương tác như cũ.
+- Tắt bằng `NOTEBOOK_ALLOW_HEADLESS=false` trong `.env`.
+
+Master token **mint được cookie phiên bất cứ lúc nào** — nhạy cảm hơn cả cookie,
+nên nó không bao giờ hiển thị trên trang admin nào.
 
 ### Phiên bản đã ghim (đọc trước khi nâng cấp)
 
@@ -88,7 +123,7 @@ rất nhanh, nên `requirements.txt` **ghim chính xác** thay vì `>=`:
 
 | Gói | Pin | Vì sao |
 |---|---|---|
-| `notebooklm-py` | `==0.8.1` | 0.8.0 đổi error contract ("absence and refusal raise") — `app/pool.py` bắt `AuthError` có kiểu vì việc này, và `generate_study_guide` đã đổi tham số free-text sang `extra_instructions`. |
+| `notebooklm-py[headless]` | `==0.8.1` | 0.8.0 đổi error contract ("absence and refusal raise") — `app/pool.py` bắt `AuthError` có kiểu vì việc này, và `generate_study_guide` đã đổi tham số free-text sang `extra_instructions`. Extra `[headless]` kéo theo `gpsoauth`, bắt buộc cho master token. |
 | `gemini-webapi` | `==2.1.1` | 2.1.0 sửa bug ChatSession dùng chung `DEFAULT_METADATA` (trước đây mọi hội thoại bị gộp làm một). 2.1.x cũng đổi tên `ModelInvalid`/`TemporarilyBlocked`/`UsageLimitExceeded` → hậu tố `*Error`. |
 | `curl_cffi` | `~=0.16.2` | Bắt buộc bởi gemini-webapi 2.1.1; cũng là bản đầu tiên có wheel Python 3.14 và target impersonate `chrome150`. |
 | `playwright` | `>=1.62` | Bundle Chromium 151. `third_party/.../useragent.py` đọc `browsers.json` của Playwright để dựng UA cho Copilot — nếu file/schema đó đổi chỗ, UA lặng lẽ rơi về fallback và Cloudflare clearance hỏng. |
@@ -171,11 +206,34 @@ Quản lý: `GET /v1/conversations`, `DELETE /v1/conversations/{id}`.
 **NotebookLM commands** (google key):
 
 ```
-POST /v1/notebooklm/generate                {notebook_id, type, instructions?}
-     # type: audio|video|report|study_guide|quiz|flashcards|slide_deck|infographic|data_table|mind_map
-GET  /v1/notebooklm/{nb}/artifacts[?type=]
-GET  /v1/notebooklm/{nb}/status/{task_id}
-GET  /v1/notebooklm/{nb}/download/{type}[?artifact_id=&format=]   # trả file (pdf/pptx/md/csv/json/png/mp4…)
+POST   /v1/notebooklm/generate                {notebook_id, type, instructions?}
+       # type: audio|video|cinematic_video|report|study_guide|quiz|flashcards
+       #       |slide_deck|infographic|data_table|mind_map
+GET    /v1/notebooklm/{nb}/artifacts[?type=]
+GET    /v1/notebooklm/{nb}/status/{task_id}
+GET    /v1/notebooklm/{nb}/download/{type}[?artifact_id=&format=]  # trả file (pdf/pptx/md/csv/json/png/mp4…)
+
+# Quản lý artifact (0.8.x)
+GET    /v1/notebooklm/{nb}/artifacts/{id}/prompt    # prompt đã sinh ra artifact
+POST   /v1/notebooklm/{nb}/artifacts/{id}/rename    {title}
+DELETE /v1/notebooklm/{nb}/artifacts/{id}
+
+# Collections — gom notebook ở mức tài khoản (0.8.1)
+GET    /v1/notebooklm/collections
+POST   /v1/notebooklm/collections                   {name}
+GET    /v1/notebooklm/collections/{id}
+GET    /v1/notebooklm/collections/{id}/notebooks
+POST   /v1/notebooklm/collections/{id}/rename       {name}
+POST   /v1/notebooklm/collections/{id}/notebooks    {notebook_ids}   # thêm
+DELETE /v1/notebooklm/collections/{id}/notebooks    {notebook_ids}   # bớt
+DELETE /v1/notebooklm/collections/{id}
+
+# Deep research — bất đồng bộ: start trả task_id, rồi poll
+POST   /v1/notebooklm/{nb}/research                 {query, source?, mode?}
+       # source: web|drive   mode: fast|deep  (deep chỉ dùng được với web)
+GET    /v1/notebooklm/{nb}/research/{task_id}
+POST   /v1/notebooklm/{nb}/research/{task_id}/import {sources, verify?}
+DELETE /v1/notebooklm/{nb}/research/{task_id}
 ```
 
 **Ảnh — ComfyUI** (comfy key; instance suy từ key):
@@ -192,9 +250,27 @@ POST /v1/images/generations
   "auto_provision": true,            // cài node/model còn thiếu của workflow trước khi render (mặc định COMFY_AUTO_PROVISION)
   "ephemeral": true                  // không lưu job trên ComfyUI (mặc định COMFY_EPHEMERAL)
 }
-GET /v1/comfy/info    # checkpoint/sampler/scheduler thật của instance
+GET /v1/comfy/info    # architecture + checkpoint/unet/clip/vae/sampler/scheduler thật của instance
 GET /v1/comfy/queue   # độ sâu hàng đợi
 ```
+
+**Workflow dựng sẵn tự khớp kiến trúc của instance.** Không cần cấu hình gì:
+MyRouter dò `/object_info` một lần cho mỗi instance (cache 5 phút, xoá ngay khi
+`/prompt` trả 400) rồi chọn đồ thị phù hợp:
+
+| Instance có | Kiến trúc | Đồ thị dựng sẵn |
+|---|---|---|
+| checkpoint all-in-one (`CheckpointLoaderSimple`) | `sd` | CheckpointLoaderSimple → CLIPTextEncode → EmptyLatentImage → KSampler (cfg 7.0, 25 steps) |
+| UNET + CLIP/VAE rời, **không có** checkpoint | `flux` | UNETLoader + DualCLIPLoader(`type=flux`) + VAELoader → FluxGuidance (3.5) → EmptySD3LatentImage → KSampler (**cfg 1.0**, 20 steps) |
+| không có gì | — | lỗi 502 `no_models_installed` |
+
+Flux dev là model guidance-distilled: cường độ nằm ở node `FluxGuidance`, còn
+KSampler chạy **cfg 1.0** (dùng cfg 7 như SD sẽ cháy ảnh), và latent là 16 kênh
+nên phải dùng `EmptySD3LatentImage`. Flux dev cũng không có negative prompt thật
+— nhánh negative là `ConditioningZeroOut`, nên `negative_prompt` bị bỏ qua trên
+instance Flux. Chỉnh qua `COMFY_FLUX_STEPS` / `COMFY_FLUX_GUIDANCE` /
+`COMFY_FLUX_SAMPLER` / `COMFY_FLUX_SCHEDULER`; `steps`/`cfg`/`sampler` gửi kèm
+request vẫn được ưu tiên. Gửi `workflow` riêng thì bỏ qua toàn bộ phần dò này.
 
 **Tự cài đặt instance (ComfyUI-Manager V3.41)** — đẩy một workflow, Manager cài custom node còn thiếu và tải model/embedding còn thiếu:
 
@@ -376,7 +452,9 @@ console.log("STREAMING:", out);
 | Chat Gemini không hiện trong lịch sử web | Đã fix (cache cookie degraded); nếu tái diễn: Re-login profile, kiểm tra log có `UNAUTHENTICATED`. |
 | `model_not_found` khi gọi Gemini | Xem model hợp lệ qua `GET /v1/models`. |
 | 9Router trả JSON dính `data: [DONE]` (non-stream) | Bug aggregate của 9Router — xem mục "Streaming vs non-streaming". Dùng streaming, hoặc trỏ thẳng sidecar, hoặc parse phòng thủ. |
-| ComfyUI 502/504 | Tunnel down hoặc checkpoint không tồn tại — kiểm tra `GET /v1/comfy/info`, `/v1/comfy/queue`. |
+| ComfyUI `503 instance_unreachable` | Tunnel/máy chết (Cloudflare trả 502, hoặc DNS/connect fail). Kiểm tra tunnel; trang Status có cột reachability. |
+| ComfyUI `502 workflow_rejected` | ComfyUI **từ chối đồ thị** khi validate. Thông báo lỗi ghi rõ node nào + input nào + các giá trị hợp lệ, ví dụ `node 4 (CheckpointLoaderSimple): ckpt_name: 'x.safetensors' not in []` — danh sách rỗng nghĩa là instance không có checkpoint (thường là máy Flux). |
+| ComfyUI `502 no_models_installed` | Instance chạy nhưng không có model nào (cả checkpoint lẫn UNET đều rỗng). |
 | Theo dõi | Bảng **Request Logs** trên dashboard (endpoint, status, latency, error); trang **Status** có thống kê 24h + reachability. |
 
 **Bảo mật**: DB chứa API key và cookie Google (bảng `google_profiles.storage_state`); session Copilot (cookie + MSAL token + browser profile) nằm ở `COPILOT_SESSION_ROOT/` trên đĩa (đã git-ignore). Chỉ chạy trên máy tin cậy, đặt mật khẩu MySQL/admin thật, không expose `/admin` ra ngoài mạng nội bộ.

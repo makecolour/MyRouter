@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     comfy_negative_prompt: str = "text, watermark, lowres, bad anatomy, blurry"
     comfy_steps: int = 25
     comfy_cfg: float = 7.0
+    # Flux instances (no all-in-one checkpoints — UNET + separate CLIP/VAE) get
+    # their own defaults, because the SD ones are actively wrong there: Flux dev
+    # carries its guidance in a FluxGuidance node and samples at CFG 1.0, so
+    # comfy_cfg=7.0 would burn every image. Detected per instance, no config.
+    comfy_flux_steps: int = 20
+    comfy_flux_guidance: float = 3.5
+    comfy_flux_sampler: str = "euler"
+    comfy_flux_scheduler: str = "simple"
     comfy_poll_interval: float = 2.0
     comfy_timeout: float = 300.0
     # Used when the OpenAI-style request says size "auto" (9Router sends this).
@@ -42,6 +50,12 @@ class Settings(BaseSettings):
     profile_sync_interval: float = 600.0  # file -> DB cookie sync period (seconds)
     login_timeout: float = 600.0  # max seconds for the interactive login
     notebook_keepalive: float = 600.0  # notebooklm-py cookie-rotation keepalive
+    # Headless re-auth: with a master token stored for the profile,
+    # notebooklm-py can mint fresh Google cookies WITHOUT opening a browser.
+    # Upstream defaults this off ("never auto-fires by default"); we default it
+    # ON because a profile with no stored token is unaffected — the L4 rung
+    # simply finds nothing and the ladder falls through to the browser login.
+    notebook_allow_headless: bool = True
     # Base interactive-login command; empty -> "<python> -m notebooklm login".
     # Per-machine override, e.g.: LOGIN_COMMAND=notebooklm login --browser msedge
     # ("--storage <profile path>" is always appended to target the profile.)

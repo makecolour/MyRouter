@@ -19,7 +19,9 @@ from ..comfy import (
     annotated_ref,
     apply_workflow_placeholders,
     build_comfy_workflow,
+    build_flux_workflow,
     comfy_generate,
+    detect_architecture,
     fetch_image_bytes,
     fetch_instance_info,
     fetch_queue,
@@ -166,6 +168,13 @@ async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
             base_url, request.workflow, wait=True
         )
         logger.info("auto-provision report: %s", report)
+    # The built-in graph has to match what the instance can actually load: an
+    # SD box has all-in-one checkpoints, a Flux box has a UNET plus separate
+    # CLIP/VAE and no checkpoints at all, and sending the wrong one is rejected
+    # at graph validation. Detected once per instance (cached in comfy.py); a
+    # caller-supplied workflow is used verbatim and needs no detection.
+    arch = None if request.workflow else await detect_architecture(base_url)
+
     urls = []
     for index in range(n):
         if request.seed is not None:
@@ -175,6 +184,21 @@ async def _handle(request: ImageGenerationRequest, ctx: AuthContext):
         if request.workflow:
             workflow = apply_workflow_placeholders(
                 request.workflow, request.prompt, width, height, seed
+            )
+        elif arch["architecture"] == "flux":
+            workflow = build_flux_workflow(
+                request.prompt,
+                width,
+                height,
+                seed,
+                arch,
+                negative_prompt=request.negative_prompt,
+                checkpoint=request.checkpoint,
+                steps=request.steps,
+                cfg=request.cfg,
+                sampler=request.sampler,
+                scheduler=request.scheduler,
+                denoise=request.denoise,
             )
         else:
             workflow = build_comfy_workflow(

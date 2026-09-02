@@ -23,6 +23,7 @@ from notebooklm import NotebookLMClient
 from .config import settings
 from .google_auth import (
     attempt_auto_relogin,
+    attempt_headless_reauth,
     extract_gemini_cookies,
     get_profile_row,
     import_profile_from_file,
@@ -76,9 +77,18 @@ async def _init_notebook(profile_name: str) -> NotebookLMClient:
     # because the client must outlive this request (pooled, closed on
     # shutdown). keepalive keeps Google cookies rotating server-side and
     # notebooklm-py's default cookie saver writes them back to `path`.
+    #
+    # allow_headless arms the L4 master-token rung inside the library's own
+    # refresh ladder (_auth/session.py): when master_token.json sits beside
+    # the storage file, a lapsed session is re-minted with NO browser and this
+    # call simply succeeds — _AuthExpired is never raised, so the visible
+    # browser relogin below never runs. Profiles without a token are
+    # unaffected; the rung finds nothing and the ladder continues.
     try:
         return await NotebookLMClient.from_storage(
-            path=str(path), keepalive=settings.notebook_keepalive
+            path=str(path),
+            keepalive=settings.notebook_keepalive,
+            allow_headless=settings.notebook_allow_headless,
         ).__aenter__()
     except Exception as exc:
         # notebooklm-py signals a dead session two ways: AuthError (typed,
@@ -179,12 +189,24 @@ async def _init_gemini(profile_name: str) -> GeminiClient:
 async def _init_with_relogin(
     profile_name: str, initializer: Callable[[str], Awaitable]
 ):
-    """Run one init attempt; on expired auth, auto re-login and retry once."""
+    """Run one init attempt; on expired auth, re-auth and retry once.
+
+    Two recovery rungs, cheapest first:
+      1. headless re-mint from the profile's master token — no browser, no
+         display, no human. Silent and fast when a token is stored.
+      2. the interactive browser login, which is what a profile with no
+         master token has always used (and still needs a display).
+    """
     try:
         return await initializer(profile_name)
     except _AuthExpired:
         await set_profile_status(profile_name, "expired")
         logger.warning("Google auth expired for '%s'", profile_name)
+        if settings.notebook_allow_headless and await attempt_headless_reauth(
+            profile_name
+        ):
+            await invalidate_profile(profile_name)
+            return await initializer(profile_name)
         if settings.auto_relogin and await attempt_auto_relogin(profile_name):
             # Fresh cookies are in the DB — drop any stale sibling clients so
             # both backends re-init from the new auth.

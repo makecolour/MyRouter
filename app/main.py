@@ -42,6 +42,7 @@ from .pool import close_all, pooled_profiles
 from . import copilot_pool
 from .routes import (
     chat,
+    collections,
     comfy_api,
     copilot_api,
     gemini_api,
@@ -49,6 +50,7 @@ from .routes import (
     models_list,
     notebooklm,
     notebooklm_api,
+    research,
 )
 
 logging.basicConfig(
@@ -137,6 +139,8 @@ app.include_router(chat.router)
 app.include_router(images.router)
 app.include_router(models_list.router)
 app.include_router(notebooklm.router)
+app.include_router(collections.router)
+app.include_router(research.router)
 # Split provider surfaces for 9Router (one Base URL per backend).
 app.include_router(gemini_api.router)
 app.include_router(notebooklm_api.router)

@@ -46,7 +46,7 @@
       <table class="table table-vcenter card-table">
         <thead>
           <tr>
-            <th>Profile</th><th>Status</th><th>Clients pooled</th>
+            <th>Profile</th><th>Status</th><th>Headless</th><th>Clients pooled</th>
             <th>Last login</th><th>Last cookie sync</th><th class="w-1">Actions</th>
           </tr>
         </thead>
@@ -60,6 +60,13 @@
               {% elif p.status == "expired" %}<span class="badge bg-red text-red-fg">expired</span>
               {% elif p.status == "pending_login" %}<span class="badge bg-yellow text-yellow-fg">pending login</span>
               {% else %}<span class="badge bg-secondary">{{ p.status }}</span>{% endif %}
+            </td>
+            <td>
+              {% if p.headless %}
+                <span class="badge bg-green text-green-fg" title="Re-auth needs no browser — cookies are minted from a stored master token{% if p.account_email %} ({{ p.account_email }}){% endif %}">yes</span>
+              {% else %}
+                <span class="badge bg-secondary" title="Re-login opens a browser window on this host. Bootstrap a master token to make it headless.">no</span>
+              {% endif %}
             </td>
             <td>{{ "yes" if p.pooled else "no" }}</td>
             <td>{{ p.last_login_at or "—" }}</td>
@@ -76,6 +83,17 @@
                     <span class="form-check-label">fresh</span>
                   </label>
                 </form>
+                {% if not p.headless %}
+                <form method="post" action="/admin/status/bootstrap-token" class="d-flex align-items-center gap-2">
+                  <input type="hidden" name="profile" value="{{ p.name }}">
+                  <input type="email" name="email" class="form-control form-control-sm" style="width: 15rem"
+                         placeholder="google account email" required>
+                  <button class="btn btn-sm btn-outline-primary" type="submit" {% if login_running %}disabled{% endif %}
+                          title="One browser sign-in mints a durable token; after this the profile re-authenticates with no browser at all.">
+                    Bootstrap headless
+                  </button>
+                </form>
+                {% endif %}
                 <form method="post" action="/admin/status/reload">
                   <input type="hidden" name="profile" value="{{ p.name }}">
                   <button class="btn btn-sm btn-outline-secondary" type="submit">Reload clients</button>
@@ -84,7 +102,7 @@
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="6" class="text-secondary">No Google profiles yet — add one below.</td></tr>
+          <tr><td colspan="7" class="text-secondary">No Google profiles yet — add one below.</td></tr>
           {% endfor %}
         </tbody>
       </table>

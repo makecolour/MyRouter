@@ -10,7 +10,6 @@ import time
 from typing import List
 
 from fastapi import APIRouter, Depends
-from gemini_webapi.constants import Model as GeminiModel
 from sqlalchemy import select
 
 from ..db import SessionLocal
@@ -22,26 +21,16 @@ logger = logging.getLogger("ai-sidecar.models")
 router = APIRouter()
 
 
-def _static_gemini_models() -> List[str]:
-    """Hardcoded fallback for when the account registry comes back empty.
-
-    NOTE: gemini_webapi marks `constants.Model` "deprecated, pending removal" —
-    model identity is discovered per account at init() now, so these members go
-    stale whenever Google renames or retiers a model. Merely iterating the enum
-    is warning-free (the lib only warns when a member is passed to
-    generate_content), but this fallback should go away once the live registry
-    in gemini_model_entries() is trusted to always populate.
-    """
-    names = []
-    for member in GeminiModel:
-        name = getattr(member, "model_name", None)
-        if name and name != "unspecified":
-            names.append(name)
-    return names
-
-
 async def gemini_model_entries(ctx: AuthContext) -> List[dict]:
-    """gemini alias + the account's registry models (static fallback)."""
+    """gemini alias + the models this account actually discovered.
+
+    There is deliberately NO hardcoded fallback list. gemini_webapi's
+    `constants.Model` enum is deprecated pending removal upstream precisely
+    because its ids go stale whenever Google renames or retiers a model — and
+    a stale id offered here would 404 at call time anyway. If the registry is
+    unavailable the list degrades to the `gemini` alias, which always routes
+    to the account's default model.
+    """
     created = int(time.time())
     data: List[dict] = [
         {"id": "gemini", "object": "model", "created": created, "owned_by": "google"}
@@ -49,51 +38,43 @@ async def gemini_model_entries(ctx: AuthContext) -> List[dict]:
     try:
         gemini_client = await get_gemini_client(ctx.profile_name)
         models = gemini_client.list_models()
+        # list_models() is sync in 2.1.x; the guard costs nothing and survives
+        # the signature flipping back.
         if inspect.isawaitable(models):
             models = await models
-        if models:
-            for m in models:
-                name = getattr(m, "model_name", None)
-                if not name or name == "unspecified":
-                    continue
-                # NOTE: is_available is NOT checked — with NotebookLM-exported
-                # cookies the registry marks Pro/Thinking unavailable even
-                # though generate_content works with them (verified live).
-                data.append(
-                    {
-                        "id": name,
-                        "object": "model",
-                        "created": created,
-                        "owned_by": "google",
-                        "display_name": getattr(m, "display_name", None),
-                    }
-                )
-        else:
-            for name in _static_gemini_models():
-                data.append(
-                    {
-                        "id": name,
-                        "object": "model",
-                        "created": created,
-                        "owned_by": "google",
-                    }
-                )
+        for m in models or []:
+            name = getattr(m, "model_name", None)
+            if not name or name == "unspecified":
+                continue
+            # NOTE: is_available is NOT checked — with NotebookLM-exported
+            # cookies the registry marks Pro/Thinking unavailable even
+            # though generate_content works with them (verified live).
+            entry = {
+                "id": name,
+                "object": "model",
+                "created": created,
+                "owned_by": "google",
+                "display_name": getattr(m, "display_name", None),
+            }
+            # Richer per-account metadata from the 2.1.x AvailableModel.
+            # Read defensively: this is a reverse-engineered registry and
+            # fields come and go between releases.
+            for src, dst in (
+                ("description", "description"),
+                ("model_id", "model_id"),
+                ("aliases", "aliases"),
+            ):
+                value = getattr(m, src, None)
+                if value:
+                    entry[dst] = value
+            data.append(entry)
     except Exception as exc:
         logger.warning(
-            "Could not list Gemini models for '%s' (falling back to the "
-            "static list): %s",
+            "Could not list Gemini models for '%s' — serving the 'gemini' "
+            "alias only: %s",
             ctx.profile_name,
             exc,
         )
-        for name in _static_gemini_models():
-            data.append(
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": created,
-                    "owned_by": "google",
-                }
-            )
     return data
 
 
