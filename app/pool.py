@@ -73,6 +73,49 @@ class _AuthExpired(Exception):
     """Internal marker: Google rejected the stored cookies."""
 
 
+class _PooledGeminiClient(GeminiClient):
+    """A GeminiClient whose *re*-inits are cheap.
+
+    gemini_webapi closes the client whenever a stream dies — its socket watchdog
+    (client.py:1842), the idle-recovery branch (:1875) and the recovery-poll
+    timeout (:1919) all call `close()`, which clears `_running`. The
+    @running(retry=5) ladder then calls `init()` again before its next attempt:
+    a get_access_token round trip plus ALL EIGHT RPCs in `_init_rpc()`.
+
+    Measured on the deployment: 17 full re-inits in 4.6 minutes, only 3 of them
+    a real startup. That is ~112 RPCs to re-establish sockets that Google had
+    just dropped, and it buried the actual chat logs.
+
+    Only two of the eight matter once the account is known:
+
+        _fetch_user_status  sets account_status, which gates stream recovery at
+                            client.py:1893 — skipping it would silently disable
+                            the recovery path
+        _sync_activity      keeps the session current; the recovery loop calls
+                            it too
+
+    The rest are telemetry. `_fetch_preferences` sends a ~4 KB payload and
+    stores NOTHING. `_quotas` / `_usage_info` / `_abuse_status` feed only
+    `_quota_reset_hint()`, a sentence appended to the usage-limit message.
+    `_recent_chats` is a chat-title cache, and MyRouter keeps its own titles in
+    the DB (see _persist_conversation).
+
+    The full set still runs on the first init, so the startup logs — quota,
+    abuse status, model list — are unchanged.
+    """
+
+    _rpc_done = False
+
+    async def _init_rpc(self) -> None:
+        if not self._rpc_done:
+            await super()._init_rpc()
+            self._rpc_done = True
+            return
+        logger.info("Gemini session re-established (light init)")
+        await self._fetch_user_status()
+        await self._sync_activity()
+
+
 def pooled_profiles() -> List[str]:
     return sorted(set(notebook_clients) | set(gemini_clients))
 
@@ -156,7 +199,7 @@ async def _init_gemini(profile_name: str) -> GeminiClient:
         )
 
     psid, psidts = extract_gemini_cookies(row.storage_state)
-    gemini_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
+    gemini_client = _PooledGeminiClient(secure_1psid=psid, secure_1psidts=psidts)
     # Feed Gemini the FULL browser cookie jar, not just the two cookies its
     # constructor accepts. Google treats PSID-only sessions as partially
     # authenticated (account status UNAUTHENTICATED, conversations not linked

@@ -488,6 +488,11 @@ class _ToolTurn:
     title: Optional[str]
     files: List[Path]
     model_kwargs: dict
+    # Size of the appended tool-protocol block, so the log can say whether a
+    # huge prompt is the caller's history or our own schema dump. Google
+    # silently drops oversized requests, and without this split there is no
+    # basis for choosing what to shrink.
+    instruction_chars: int = 0
 
 
 async def _setup_tool_turn(
@@ -523,40 +528,58 @@ async def _setup_tool_turn(
         title=title,
         files=files,
         model_kwargs=model_kwargs,
+        instruction_chars=len(instruction),
     )
 
 
 def _is_transient_upstream(exc: Exception) -> bool:
-    """True for Google aborting a generation mid-flight (not an account fault).
+    """True for a Google-side abort that gemini_webapi did NOT already retry.
 
-    gemini_webapi surfaces these as APIError("The original request may have been
-    silently aborted"), APIError("Unknown API error code: …") and
-    GeminiError("The connection to Gemini was lost …, and recovery timed out").
-    All three mean "send it again", not "this account is dead".
+    The distinction is the exception CLASS, and it decides whether retrying here
+    helps or just doubles the work. `APIError` and `GeminiError` are siblings in
+    gemini_webapi/exceptions.py, and the @running(retry=5) ladder wrapping
+    `_generate` catches `except APIError` only:
+
+        APIError    "The original request may have been silently aborted"
+                    "Unknown API error code: … temporary Google service issue"
+                    -> already re-sent up to six times by the ladder. Retrying
+                       here made it twelve sends of a >100 KB prompt.
+        GeminiError "The connection to Gemini was lost …, recovery timed out"
+                    -> raised at client.py:1921 and never retried by the
+                       library, so this retry is the only one it gets.
+
+    Every other GeminiError subclass (TimeoutError, UsageLimitExceededError,
+    ModelInvalidError, TemporarilyBlockedError) means "stop", and is excluded by
+    the marker below rather than by class.
     """
-    if not isinstance(exc, (GeminiAPIError, GeminiError)):
+    if isinstance(exc, GeminiAPIError) or not isinstance(exc, GeminiError):
         return False
-    message = str(exc).lower()
-    return any(
-        marker in message
-        for marker in (
-            "silently aborted",
-            "unknown api error code",
-            "connection to gemini was lost",
-            "temporary google service issue",
-        )
-    )
+    return "connection to gemini was lost" in str(exc).lower()
 
 
 async def _ask_gemini(turn: _ToolTurn, send_text: str):
+    # `current_retry` caps gemini_webapi's @running(retry=5) ladder for this one
+    # call. Not a monkeypatch: generate_content and send_message both take
+    # **kwargs and forward them to _generate, and the decorator's
+    # asyncgen_wrapper(client, *args, current_retry=None, **kwargs) POPS it
+    # before the request is built, so it never reaches curl_cffi.
+    #
+    # Note the back-off is (retry - current_retry + 1) * 5, computed from the
+    # decorator's own retry=5 rather than from what is left — so current_retry=1
+    # buys one retry after 25s, not 5s. Fewer attempts, spaced wider; still far
+    # cheaper than six sends of the whole prompt plus 75s of sleeps.
+    capped = {"current_retry": settings.gemini_generate_retries}
     if turn.session is None:
         return await turn.client.generate_content(
             send_text,
             files=turn.files or None,
             temporary=settings.chat_temporary,
             **turn.model_kwargs,
+            **capped,
         )
-    return await turn.session.send_message(send_text, files=turn.files or None)
+    return await turn.session.send_message(
+        send_text, files=turn.files or None, **capped
+    )
 
 
 async def _run_tool_turn(
@@ -571,11 +594,14 @@ async def _run_tool_turn(
     """
     names = tool_names(request.tools)
     logger.info(
-        "chat -> Gemini tools (profile=%s, model=%s, tools=%d, prompt=%d chars)",
+        "chat -> Gemini tools (profile=%s, model=%s, tools=%d, prompt=%d chars "
+        "= history %d + schemas %d)",
         ctx.profile_name,
         model,
         len(request.tools or []),
         len(turn.send_text),
+        len(turn.send_text) - turn.instruction_chars,
+        turn.instruction_chars,
     )
     started = time.perf_counter()
     try:

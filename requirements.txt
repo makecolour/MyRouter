@@ -12,12 +12,19 @@ sqladmin>=0.29
 itsdangerous>=2.1
 # Pinned exactly: both libraries are reverse-engineered clients that move fast
 # and break their own surface. See README "Pinned versions" before bumping.
-# ==0.8.1: 0.8.0 flipped the error contract ("absence and refusal raise") — the
-# auth-expiry branch in app/pool.py matches typed exceptions because of it.
+# ==0.8.2: 0.8.0 flipped the error contract ("absence and refusal raise") — the
+# auth-expiry branch in app/pool.py matches typed exceptions because of it, so
+# the pin is exact. 0.8.2 does NOT repeat that: it is a large internal release
+# (364 -> 510 files, an _android backend, _artifact split up) whose public
+# surface is purely additive — 142 -> 154 exports with nothing removed, every
+# typed exception still there, and from_storage keeping keepalive and
+# allow_headless while merely gaining `backend`.
 # [headless] adds gpsoauth, which lets notebooklm-py mint Google cookies from
 # a durable master token with NO browser — see app/google_auth.py
-# attempt_headless_reauth and the README bootstrap section.
-notebooklm-py[headless]==0.8.1
+# attempt_headless_reauth and the README bootstrap section. That extra is
+# unchanged; the new grpcio/protobuf pins belong to the `android` extra, which
+# we do not install.
+notebooklm-py[headless]==0.8.2
 # ==2.1.1: 2.1.0 fixed the shared-DEFAULT_METADATA ChatSession bug that
 # app/routes/chat.py used to patch around, and pins curl-cffi~=0.16.2.
 gemini-webapi==2.1.1

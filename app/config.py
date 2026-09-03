@@ -132,11 +132,17 @@ class Settings(BaseSettings):
     # parsers ignore, so they can't pollute content or the derived usage. Set
     # false to send empty-delta chunks instead, for a router that mishandles them.
     sse_keepalive_comment: bool = True
-    # Retry once when Google silently aborts a generation (gemini_webapi raises
-    # APIError "silently aborted"/"Unknown API error code" or GeminiError
-    # "connection ... was lost"). These are one-off upstream aborts, not account
-    # failures.
+    # Retry once when Google aborts a generation — but ONLY for the aborts
+    # gemini_webapi does not already retry itself. See _is_transient_upstream,
+    # which splits them by exception class.
     gemini_retry_transient: bool = True
+    # How many times gemini_webapi's own @running ladder may re-send a failed
+    # generation, passed per call as `current_retry`. Its default is 5, i.e. six
+    # sends of the ENTIRE prompt with 5+10+15+20+25s of back-off between them.
+    # An agentic client's prompt is >100 KB, so the default costs minutes of
+    # latency and six times the account quota for an error a re-send will not
+    # change. Raise it only if genuinely transient aborts start slipping through.
+    gemini_generate_retries: int = 1
     # Hard ceiling for one Gemini turn including the retry — keeps a wedged call
     # from outliving the caller's own timeout in silence.
     gemini_turn_timeout: float = 300.0
