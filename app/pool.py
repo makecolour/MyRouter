@@ -239,6 +239,7 @@ async def _init_gemini(profile_name: str) -> GeminiClient:
             auto_refresh=False,
             timeout=settings.gemini_timeout,
             watchdog_timeout=settings.gemini_watchdog_timeout,
+            verbose=settings.gemini_verbose,
         )
     except AuthError as exc:
         raise _AuthExpired() from exc

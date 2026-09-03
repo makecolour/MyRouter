@@ -62,6 +62,7 @@ from ..security import AuthContext, describe_error, log_request, require_google_
 from ..tools import (
     build_repair_instruction,
     build_tool_instruction,
+    instruction_costs,
     looks_like_a_mangled_call,
     parse_tool_calls,
     tool_names,
@@ -506,7 +507,9 @@ async def _setup_tool_turn(
     """
     model_kwargs = {"model": model} if model.startswith("gemini-") else {}
     conv_id_in = (request.conversation_id or "").strip() or None
-    instruction = build_tool_instruction(request.tools, request.tool_choice)
+    instruction = build_tool_instruction(
+        request.tools, request.tool_choice, settings.tool_desc_limit
+    )
     try:
         client = await get_gemini_client(ctx.profile_name)
         session, send_text, conv_id, is_new, title = await _prepare_gemini_session(
@@ -593,16 +596,28 @@ async def _run_tool_turn(
     Returns (text, tool_calls_or_None).
     """
     names = tool_names(request.tools)
+    desc_chars, schema_chars, per_tool = instruction_costs(
+        request.tools, settings.tool_desc_limit
+    )
     logger.info(
         "chat -> Gemini tools (profile=%s, model=%s, tools=%d, prompt=%d chars "
-        "= history %d + schemas %d)",
+        "= history %d + schemas %d [desc %d + json %d])",
         ctx.profile_name,
         model,
         len(request.tools or []),
         len(turn.send_text),
         len(turn.send_text) - turn.instruction_chars,
         turn.instruction_chars,
+        desc_chars,
+        schema_chars,
     )
+    if per_tool:
+        # Names whichever tools are worth trimming, without adding a line per
+        # request to the default log.
+        logger.debug(
+            "largest tools: %s",
+            ", ".join(f"{name} {size}" for name, size in per_tool[:5]),
+        )
     started = time.perf_counter()
     try:
         try:

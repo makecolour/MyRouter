@@ -137,6 +137,20 @@ class LadderCap(unittest.TestCase):
         client, delays = self._run(current_retry=1)
         self.assertEqual(client.attempts, 2)
 
+    def test_zero_is_a_single_attempt_with_no_backoff(self):
+        """What we ship. The failure we actually see is a request that never
+        produced a first byte, and a re-send pays the same prefill cost with the
+        same odds - so the budget goes into one patient attempt instead."""
+        client, delays = self._run(current_retry=0)
+        self.assertEqual(client.attempts, 1)
+        self.assertEqual(delays, [])
+
+    def test_the_shipped_setting_is_a_single_attempt(self):
+        from app.config import settings
+
+        client, _ = self._run(current_retry=settings.gemini_generate_retries)
+        self.assertEqual(client.attempts, settings.gemini_generate_retries + 1)
+
     def test_the_kwarg_never_reaches_the_request(self):
         """It must be popped by the wrapper - kwargs are documented as going
         through to curl_cffi, which would reject it."""

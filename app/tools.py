@@ -65,6 +65,17 @@ _DESC_LIMIT = 200
 # Below this nesting depth, a property's prose is dead weight: the model needs
 # the shape of a nested object, not an essay about each leaf.
 _DESC_MAX_DEPTH = 2
+# _DESC_LIMIT above only ever applied to schema PROPERTIES. A tool's own
+# description went upstream verbatim, and an agentic client's are long: 27 qwen
+# tools measured 56 KB of instruction. This caps them; 500 keeps the opening
+# "what it does" sentence, which is what the model actually selects on.
+_TOOL_DESC_LIMIT = 500
+
+
+def _clip(text: str, limit: int) -> str:
+    """Truncate on a character budget, marking that something was cut."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
 def _compact_schema(node: Any, depth: int = 0) -> Any:
@@ -80,9 +91,7 @@ def _compact_schema(node: Any, depth: int = 0) -> Any:
         if key == "description":
             if depth > _DESC_MAX_DEPTH or not isinstance(value, str):
                 continue
-            text = value.strip()
-            if len(text) > _DESC_LIMIT:
-                text = text[:_DESC_LIMIT].rstrip() + "…"
+            text = _clip(value, _DESC_LIMIT)
             if text:
                 out[key] = text
             continue
@@ -92,7 +101,42 @@ def _compact_schema(node: Any, depth: int = 0) -> Any:
     return out
 
 
-def build_tool_instruction(tools: List[dict], tool_choice: Any) -> str:
+def _tool_lines(tool: Any, desc_limit: int) -> Tuple[str, str, str]:
+    """(name, description line, schema line) for one tool, already trimmed."""
+    fn = tool.get("function") or {} if isinstance(tool, dict) else {}
+    name = fn.get("name", "?")
+    desc = _clip(fn.get("description", ""), desc_limit)
+    params = _compact_schema(fn.get("parameters", {}))
+    return (
+        name,
+        f"- {name}: {desc}",
+        f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}",
+    )
+
+
+def instruction_costs(
+    tools: List[dict], desc_limit: int = _TOOL_DESC_LIMIT
+) -> Tuple[int, int, List[Tuple[str, int]]]:
+    """What the tool block costs: (description chars, schema chars, per tool).
+
+    The per-tool list is sorted largest first, so one DEBUG line names whichever
+    tools are worth trimming. Built from the same _tool_lines the prompt uses, so
+    the figures cannot drift from what is actually sent.
+    """
+    desc_chars = schema_chars = 0
+    per_tool: List[Tuple[str, int]] = []
+    for tool in tools or []:
+        name, desc_line, schema_line = _tool_lines(tool, desc_limit)
+        desc_chars += len(desc_line) + 1  # +1 for the newline that joins them
+        schema_chars += len(schema_line) + 1
+        per_tool.append((name, len(desc_line) + len(schema_line) + 2))
+    per_tool.sort(key=lambda item: item[1], reverse=True)
+    return desc_chars, schema_chars, per_tool
+
+
+def build_tool_instruction(
+    tools: List[dict], tool_choice: Any, desc_limit: int = _TOOL_DESC_LIMIT
+) -> str:
     """A protocol block describing the tools + the exact output contract."""
     lines = [
         "You can call tools. When you decide to use one or more tools, reply "
@@ -109,12 +153,9 @@ def build_tool_instruction(tools: List[dict], tool_choice: Any) -> str:
         "Available tools:",
     ]
     for tool in tools:
-        fn = tool.get("function") or {} if isinstance(tool, dict) else {}
-        name = fn.get("name", "?")
-        desc = fn.get("description", "")
-        params = _compact_schema(fn.get("parameters", {}))
-        lines.append(f"- {name}: {desc}")
-        lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
+        _, desc_line, schema_line = _tool_lines(tool, desc_limit)
+        lines.append(desc_line)
+        lines.append(schema_line)
 
     # Forcing semantics from tool_choice.
     if isinstance(tool_choice, str) and tool_choice.strip().lower() == "required":

@@ -141,17 +141,46 @@ class Settings(BaseSettings):
     # sends of the ENTIRE prompt with 5+10+15+20+25s of back-off between them.
     # An agentic client's prompt is >100 KB, so the default costs minutes of
     # latency and six times the account quota for an error a re-send will not
-    # change. Raise it only if genuinely transient aborts start slipping through.
-    gemini_generate_retries: int = 1
+    # change.
+    #
+    # 0 means a single attempt, and that is deliberate: the failure we actually
+    # see is a request that never produced a first byte, and a re-send pays the
+    # same prefill cost with the same odds. One patient attempt (see
+    # gemini_watchdog_timeout) beats two impatient ones.
+    gemini_generate_retries: int = 0
     # Hard ceiling for one Gemini turn including the retry — keeps a wedged call
     # from outliving the caller's own timeout in silence.
     gemini_turn_timeout: float = 300.0
-    # Passed to GeminiClient.init(). The library applies `timeout` while the model
-    # is thinking or queueing and `watchdog_timeout` only to a genuinely idle
-    # socket, so a short watchdog shortens zombie detection (its 120s default plus
-    # a 120s recovery poll = 240s of silence) without cutting slow answers short.
+    # Passed to GeminiClient.init().
+    #
+    # `watchdog_timeout` is a FIRST-BYTE deadline, not just an idle-socket one.
+    # The library picks `timeout if (is_thinking or is_queueing) else
+    # min(timeout, watchdog_timeout)`, and both flags start False
+    # (client.py:1558) — they only flip once a frame arrives. So a request still
+    # in prefill has not signalled thinking, does not qualify for `timeout`, and
+    # is killed at watchdog_timeout + 5.
+    #
+    # This was 45s on the reasoning that a short watchdog only shortens zombie
+    # detection. It does not: it was cutting off live requests. Measured on the
+    # deployment, every request that produced a first byte finished in under 8s
+    # and every one that did not was killed at 50s — including prompts smaller
+    # than ones that had just succeeded.
+    #
+    # 120s budget => ~125s to fail, inside gemini_turn_timeout. Keep it at least
+    # 30s BELOW 9router's upstream timeout, or 9router gives up and retries while
+    # this is still waiting, re-amplifying what the single attempt above removes.
     gemini_timeout: float = 240.0
-    gemini_watchdog_timeout: float = 45.0
+    gemini_watchdog_timeout: float = 120.0
+    # Ask gemini_webapi to accumulate raw response frames and dump them when a
+    # stream suspends. The only way to see what an unknown error code actually
+    # is — its ErrorCode enum knows 1013/1037/1050/1052/1060, and we keep getting
+    # 1096 and 1155. Off by default: it logs whole raw responses.
+    gemini_verbose: bool = False
+    # Cap on a tool's OWN description in the emulated tool-calling prompt. The
+    # nested _DESC_LIMIT never applied to it, so agentic clients were shipping
+    # every word upstream — 56 KB of schemas for 27 tools. 500 keeps the opening
+    # "what it does" sentence, which is what drives tool choice.
+    tool_desc_limit: int = 500
     # When the model ignores the tool_calls contract and answers with a stub,
     # re-ask once with a contract-only nudge before giving up.
     tool_repair_retry: bool = True
