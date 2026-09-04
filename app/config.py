@@ -147,7 +147,7 @@ class Settings(BaseSettings):
     # see is a request that never produced a first byte, and a re-send pays the
     # same prefill cost with the same odds. One patient attempt (see
     # gemini_watchdog_timeout) beats two impatient ones.
-    gemini_generate_retries: int = 0
+    gemini_generate_retries: int = 1
     # Hard ceiling for one Gemini turn including the retry — keeps a wedged call
     # from outliving the caller's own timeout in silence.
     gemini_turn_timeout: float = 300.0
@@ -169,8 +169,8 @@ class Settings(BaseSettings):
     # 120s budget => ~125s to fail, inside gemini_turn_timeout. Keep it at least
     # 30s BELOW 9router's upstream timeout, or 9router gives up and retries while
     # this is still waiting, re-amplifying what the single attempt above removes.
-    gemini_timeout: float = 240.0
-    gemini_watchdog_timeout: float = 120.0
+    gemini_timeout: float = 600.0
+    gemini_watchdog_timeout: float = 300.0
     # Ask gemini_webapi to accumulate raw response frames and dump them when a
     # stream suspends. The only way to see what an unknown error code actually
     # is — its ErrorCode enum knows 1013/1037/1050/1052/1060, and we keep getting
